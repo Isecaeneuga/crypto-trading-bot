@@ -32,7 +32,7 @@ The repository has three parts:
     ├── data_collection.py  features.py  scoring.py  strategy.py
     ├── execution.py  dex.py  database.py
     ├── templates/dashboard.html
-    └── artifacts/                 models, reference distributions, parameters (from notebook 5)
+    └── artifacts/                 the two models (from notebook 5)
 ```
 
 The notebooks create their data folders (`raw_data/`, `processed_data/`, `dataset_v9/`, `model_search/`, `model_results/`, `strategy_results/`) next to themselves. The data and the trained artifacts are not part of the repository.
@@ -51,7 +51,7 @@ The notebooks create their data folders (`raw_data/`, `processed_data/`, `datase
 
 **Direction:** whether the price first reaches +15% or −15% within the next 2 hours. The *direction model* estimates the probability that +15% comes first.
 
-**Score / percentile:** a model output converted to its rank within the model's predictions on the *tune* split (0 = lowest, 1 = highest). All strategy thresholds are on these percentiles, so they mean the same in research and live.
+**Score / percentile:** in the research, a model output converted to its rank within the model's predictions on the *tune* split (0 = lowest, 1 = highest). All strategy thresholds are on these percentiles, so they mean the same for any model. The live bot uses the equivalent raw cutoff (see *The models and scores*), so it needs no tune predictions. In research and live.
 
 **Candidate minute:** a minute that passes the entry gate (combo score and price-position filters). Buys and rebases only happen on candidate minutes.
 
@@ -150,13 +150,13 @@ Picking the best of many runs on validation selects for validation luck: that ru
 
 What a bot does, end to end:
 
-1. **History.** On its first start it fetches the coin's full minute history from GeckoTerminal (1000 candles per request, up to `historical_days` back) and applies the fill rule. It refuses to start if the history does not reach the coin's first minute, because several features (minutes since launch, launch and all-time-high features, the 12-hour trading start) depend on it.
-2. **Every minute** it fetches the newest candles, re-checks the previous minute for late revisions, and appends the new minutes to the history.
+1. **History.** On its first start it fetches the coin's full minute history from GeckoTerminal, paging backwards 1000 candles per request (15 s apart) until the API has nothing older, and applies the fill rule. The history must start at the coin's first candle, because several features (minutes since launch, the launch and all-time-high features, the liquidity estimate) are anchored to it, so a page that fails after its retries stops the bot with an error instead of running on a partial history.
+2. **Every minute** it fetches the newest candles, re-checks the previous minute for late revisions, and appends the new minutes to the history with the same fill rule.
 3. **Features.** It computes the 169 features for the new minute(s) with the dataset notebook's own code (`features.py`).
-4. **Scores.** The move and direction models predict; the predictions become three percentile scores: *combo*, *direction* and *move* (`scoring.py`).
+4. **Scores.** The move and direction models predict; their product is the *combo* score (`scoring.py`).
 5. **Strategy.** The A50 state machine (`strategy.py`) decides: buy, sell, rebase or nothing.
 6. **Execution.** Paper or shadow fills (`execution.py`, `dex.py`).
-7. **Records.** Candles, scores, trades, capital and the full strategy state go to the SQLite database; the dashboard reads from there.
+7. **Records.** Candles, scores, trades, capital and the strategy state go to the SQLite database; the dashboard reads from there.
 
 ### Architecture
 
@@ -184,66 +184,62 @@ The system is **process-oriented**: the web app and one worker process per bot c
                   └────────────────────┘
 ```
 
-A bot's strategy state (open position, phase, races, re-entry bookkeeping) is saved as JSON after **every minute**. A stopped or crashed bot therefore resumes exactly where it was: it reloads the stored history, fetches the missing minutes, and replays them through the state machine. It does not buy on minutes in the past; a sell that became due while it was down is executed at once.
+A bot's strategy state (open position, phase, races, peak, re-entry bookkeeping) is stored in the `bot_trading_state` table and written whenever it changes. A stopped or crashed bot resumes from that state: it reloads its full stored history, fetches every minute it missed (page by page, however long it was down) and fills them in, so the features stay exact. The missed minutes are not scored or traded; trading continues with the next new minute.
+
+The dashboard follows the database through a live update stream: `app.py` checks a set of change markers once a second and pushes them over `/api/stream` (Server-Sent Events) only when something changed.
 
 ### Files
 
 | File | Responsibility |
 | --- | --- |
-| `app.py` | Flask server: the dashboard and its API, plus the SOL-price background thread |
+| `app.py` | Flask server: the dashboard, its API and the live update stream (`/api/stream`), plus the SOL-price background thread |
 | `bot_manager.py` | Bot process lifecycle (initialise / start / pause / resume / stop / deallocate) and the dashboard's bot data |
 | `bot_loop.py` | Per-bot worker process: the only module that wires everything together |
-| `data_collection.py` | GeckoTerminal OHLCV fetching (full history, gap filling, live minutes), rate-limit handling, the fill rule |
-| `features.py` | The feature code of `Dataset_creationV9`, copied verbatim, plus a live section that computes only the newest minutes |
-| `scoring.py` | Loads the two models and turns their predictions into the three percentile scores |
-| `strategy.py` | The A50 strategy as a minute-by-minute state machine, its parameters and its fill prices |
+| `data_collection.py` | GeckoTerminal OHLCV fetching (full history, the gap after a restart, live minutes), rate-limit handling, the fill rule |
+| `features.py` | The feature code of `Dataset_creationV9`, copied verbatim without the labels, plus an incremental version of the liquidity estimate and the per-bot `LiveFeatureEngine` |
+| `scoring.py` | Loads the two models and computes P(move), P(direction) and the combo score |
+| `strategy.py` | The A50 strategy as a minute-by-minute state machine, its hard-coded parameters and its fill prices |
 | `execution.py` | Buy and sell execution: paper and shadow (live stubbed) |
 | `dex.py` | Jupiter swap quotes and network-fee estimates for shadow mode (never signs or sends) |
-| `database.py` | SQLite schema, migrations, queries and all persistence |
-| `templates/dashboard.html` | Single-page frontend served by Flask |
+| `database.py` | SQLite schema, queries, all persistence, and the change markers behind the live update stream |
+| `templates/dashboard.html` | Single-page frontend served by Flask (Plotly charts) |
 
 ### From the notebooks to the bot
 
-The last cell of `strategy.ipynb` writes everything the bot needs to `strategy_results/live_artifacts/`. Copy those files into `live_pipeline/artifacts/`:
+The last cell of `strategy.ipynb` copies the two chosen models to `strategy_results/live_artifacts/`; copy them into `live_pipeline/artifacts/`:
 
 ```
 artifacts/
-├── move.ubj, direction.ubj           the chosen models (each file carries its feature list)
-├── ref_move.npy, ref_direction.npy   the sorted tune predictions: the reference
-├── ref_combo.npy                     distributions of the percentile scores
-└── best_params.json                  the parameters of the best val run (used as a whole)
+└── move.ubj, direction.ubj    the chosen models (each file carries its feature list)
 ```
 
-The models and the parameters must come from the same run of the notebook, because the parameters were tuned on these models' scores.
+The same cell prints the parameters of the best val run as a `TUNED_PARAMS` block, including `combo_cutoff`; they are hard-coded in `strategy.py`. The models and the parameters must come from the same run of the notebook, because the parameters were tuned on these models' scores.
 
-**Alignment with the notebooks.** Before publishing, the live code was checked against the notebooks with their own code (FINDINGS §41):
-* the features are bit-identical to the dataset, including the incremental computation;
-* the strategy produces the same trades as the research simulator on 600 random coins and parameter sets;
-* the scores equal the notebook's predictions and percentiles;
-* the fill rule equals the cleaning notebook's.
+**Alignment with the notebooks.** The live code was checked against the notebooks' own code:
+* **Features:** all 169 values are identical to `compute_coin_features_v9` on a synthetic 12,000-minute coin with gaps and zero-volume minutes, both on the full history and minute by minute on the history up to each minute, with the bot's Europe/Amsterdam timestamps across a daylight-saving change. The incremental liquidity estimate gives the same values as the notebook's function, also after a revised minute.
+* **Strategy:** the bot's decision logic, replayed minute by minute on 30 random synthetic coins, makes the same trades and ends with the same capital as the notebook's simulator (with the simulator's 12-hour trading start set to 0, because the live bot has none; see *Entry*).
+* **Fill rule:** identical to the cleaning notebook's, also when new minutes are appended to a stored history.
+* **Scores:** the models are loaded with their own feature lists and predict with `iteration_range=(0, best_iteration + 1)`, as in the research. The live scores have not yet been compared with the notebook's saved predictions from the real models.
 
 ### The models and scores
 
-Two XGBoost models score every minute; they are loaded once when a bot starts (from `global_settings.model_dir`, default `artifacts`). Predictions use `iteration_range=(0, best_iteration + 1)`, as in the research. The raw predictions become three **percentile scores**, each the share of the saved tune predictions at or below the value:
+Two XGBoost models score every minute; they are loaded once when a bot starts (from `global_settings.model_dir`, default `artifacts`). Predictions use `iteration_range=(0, best_iteration + 1)`, as in the research. The buy score is the **combo**, P(move) × P(direction).
 
-* **combo** = percentile of P(move) × P(direction): the buy gate;
-* **direction** = percentile of P(direction);
-* **move** = percentile of P(move).
-
-The direction and move scores are shown on the dashboard and used only by the (disabled) signal exit.
+In the research the buy threshold is a percentile: `confidence_threshold = 0.8619` means "a combo higher than 86.19% of the tune minutes". A percentile only grows with the raw value, so the same gate is exactly "combo ≥ `combo_cutoff`", where `combo_cutoff` is the tune combo at that rank. The export cell computes it once (and checks that it selects the same tune minutes), so the live bot needs only the two models. The dashboard shows the raw combo, P(direction) and P(move).
 
 ### The trading strategy: A50, rebase mode
 
-One position per coin, evaluated once per closed minute. All parameters come from `artifacts/best_params.json`.
+One position per coin, evaluated once per closed minute. The tuned parameters are hard-coded in `strategy.py` (`TUNED_PARAMS`).
 
 **Entry.** Buy at the close (plus slippage) when all of these hold:
 
-1. the coin is at least **720 minutes** (12 h) past its first candle;
-2. `combo ≥ confidence_threshold`;
-3. `price_position_15m ≤ max_price_position_15m` and `price_position_1h ≤ max_price_position_60m` (where the price sits within the last 15 / 60 minutes' range; this avoids buying on a local peak);
-4. after a sale, the **re-entry rule**: the price must be at least `reentry_threshold_pct` below the last sale price. After `reentry_decay_start_minutes` the required drop shrinks by `reentry_decay_rate` per minute (it can become a premium), until the rule no longer applies.
+1. `combo ≥ combo_cutoff` (the raw form of the tuned `confidence_threshold` percentile);
+2. `price_position_15m ≤ max_price_position_15m` and `price_position_1h ≤ max_price_position_60m` (where the price sits within the last 15 / 60 minutes' range; this avoids buying on a local peak);
+3. after a sale, the **re-entry rule**: the price must be at least `reentry_threshold_pct` below the last sale price. After `reentry_decay_start_minutes` the required drop shrinks by `reentry_decay_rate` per minute (it can become a premium), until the rule no longer applies.
 
-The buy size is the bot's capital, capped so that the buy stays within the price-impact cap (`max_price_impact_pct`, default 0.333%, using the causal 1%-impact liquidity estimate from the features).
+The buy size is the bot's capital, capped so that the buy stays within the price-impact cap (`max_price_impact_pct`, default 0.333%): at most `estimated_sol_1pct_impact × max_price_impact_pct × 100` SOL, using the causal 1%-impact liquidity estimate from the features. While no estimate exists yet, the whole capital is used, as in the simulator.
+
+**No 12-hour start.** The research simulator never buys in a coin's first 720 minutes (12 h); the live bot can buy from the first minute with features (minute 120). The tuned parameters and the results above come from simulations with the 12-hour start, so early trades on young coins are outside what was tested.
 
 **Exits.**
 
@@ -252,28 +248,44 @@ The buy size is the bot's capital, capped so that the buy stays within the price
 * **Stale time:** after `stale_trade_minutes` in the current segment, the position enters a *stale race*.
 * **Races never sell.** During a race, the first candidate minute that passes the re-entry rule *rebases* the position: the reference becomes that minute's close, the peak resets, and the shares stay.
 
-Within a minute the order is: rebase check → take-profit → (signal exit) → loss floor / stale transitions. `strategy.py` documents the details; the research simulator in `strategy.ipynb` is the authority on the logic.
+Within a minute the order is: rebase check → take-profit → loss floor / stale transitions. `strategy.py` documents the details; the research simulator in `strategy.ipynb` is the authority on the logic.
 
-**Signal exit: off.** The research also tried a *signal exit* (sell when the direction or move score drops below a threshold). Its gains came from a look-ahead in the simulator (FINDINGS §35); with the simulator fixed it adds nothing. It stays behind the `signal_exit_enabled` switch for research only.
+**No signal exit.** The research also tried a *signal exit* (sell when the direction or move score drops below a threshold). Its gains came from a look-ahead in the simulator (FINDINGS §35); with the simulator fixed it added nothing, so the live bot has none.
 
 **Slippage** of 1.5% per side in paper mode (`static_trading_fee_pct`), as in the simulations: on the high side on purpose, to keep paper results pessimistic.
 
-**Parameters.** On startup, `database.py` loads `best_params.json` into the `strategy_config` table and stores a hash of the file. Replacing the file loads the new parameters on the next restart. Edits through `/api/config/strategy` are validated and last until the file changes.
+**Parameters.** The parameters are hard-coded in `strategy.py` (`TUNED_PARAMS`, the best-on-val run of `strategy.ipynb`). The dashboard reads them from `/api/config/strategy`, which is read-only. To change them, edit `strategy.py` and restart the bots.
+
+| Parameter | Value | Search range |
+| --- | --- | --- |
+| `confidence_threshold` (tune percentile) | 0.861851 | 0 – 1 |
+| `combo_cutoff` (its raw combo) | 0.3475198447704315 | — |
+| `max_price_position_15m` | 0.435592 | 0.05 – 0.95 |
+| `max_price_position_60m` | 0.354948 | 0.05 – 0.95 |
+| `activation_threshold` (take-profit) | 0.236134 | 0.1 – 0.35 |
+| `stale_trade_minutes` | 841 | 60 – 1440 |
+| `reentry_threshold_pct` | 0.191757 | 0.005 – 0.2 |
+| `reentry_decay_rate` | 0.00924998 | 0.0005 – 0.01 |
+| `reentry_decay_start_minutes` | 74 | 20 – 180 |
+| `loss_floor_pct` | 0.260773 | 0.15 – 0.4 |
+| `loss_floor_consecutive_minutes` | 14 | 2 – 15 |
 
 ### Features in the live bot
 
-* `features.compute_live_features(all_data, last_n)` computes the newest `last_n` minutes from the coin's full history; timestamps are converted to UTC inside, and the last 30 minutes are padded internally (the features are causal, so the padding does not change them).
-* The first **120 minutes** of a coin have no features.
-* **Exact optimisation:** the notebook code recomputes the whole history on every call (~3 s at 30 days of history). The live copy computes only the requested rows and caches the finished blocks of the liquidity estimate. The result is bit-identical and takes ~0.1 s per minute. These are the only edits to the notebook code, marked `LIVE OPTIMISATION` in `features.py`.
+* Each bot keeps a `LiveFeatureEngine`. At startup it builds the liquidity estimate over the coin's full history; after that, `sync` processes each new minute and `revise` re-processes a minute that GeckoTerminal revised.
+* `engine.features(all_data, rows)` calls `compute_live_features(df, rows, liquidity)`, the notebook's per-minute feature code for the requested rows only, without the labels and without the notebook's 30-minute cut at the end of a coin.
+* The hour-of-day features use **UTC** hours, as the dataset does (its loader parses timestamps as UTC), whatever timezone the bot keeps its data in.
+* The first **120 minutes** of a coin have no features, as in the dataset.
+* **Cost.** The rolling statistics are recomputed over the full history on every call, because their values depend on the history from the coin's first row; this is what keeps them identical to the dataset. In testing (not on the Pi) a new minute took about 45 ms for a 12,000-minute coin. The liquidity estimate is the only incremental part: the notebook version recomputes the coin's whole history; `CausalLiquidity` keeps its state between minutes and gives the same values.
 * After a change to the feature code in `Dataset_creationV9`, copy it into `features.py` again.
 
 ### Data and timing
 
-* **Full history.** A bot only trades a coin whose history it has from the first candle. With `historical_days = 30`, coins up to 30 days old can be initialised; older coins are refused with an explanation.
-* **Minute grid and fill rule.** All history is kept on a gap-free one-row-per-minute grid. Every zero-volume minute, whether skipped by the API or returned as an empty interval, is a flat candle at the last real close: exactly the rule of the research data. After a restart the gap is fetched page by page, so long outages are filled completely.
-* **When a minute is read.** The bot waits until second `grace_period_seconds` (paper mode, default 5) after each minute, fetches, and takes candles up to `now − finalization_lag_minutes`. GeckoTerminal may still revise a candle after its minute ends; the previous minute is re-checked on every fetch and corrected if it changed. The finalization study measures how late candles become final; its first reading suggests the read time needs to be much later than 5 s.
+* **Full history.** A bot fetches as much history as GeckoTerminal has, from the coin's first candle. GeckoTerminal's minute data reaches back roughly six months, so for an older coin the history would start late and the launch-anchored features would differ from the dataset's; the bots are meant for young coins.
+* **Minute grid and fill rule.** All history is kept on a gap-free one-row-per-minute grid. Every zero-volume minute, whether skipped by the API or returned as an empty interval, is a flat candle at the last real close: exactly the rule of the research data. After a restart the gap is fetched page by page, so long outages are filled completely; if the gap can't be fetched, the bot stops with an error rather than filling it with flat candles.
+* **When a minute is read.** The bot waits until second `grace_period_seconds` (paper mode, default 5) after each minute, fetches, and takes candles up to `now − finalization_lag_minutes`. GeckoTerminal may still revise a candle after its minute ends; the previous minute is re-checked on every fetch and, if it changed, corrected and re-processed by the feature engine. The finalization study measures how late candles become final; its first reading suggests the read time needs to be much later than 5 s.
 * **Clock.** The read time is measured with the host's clock, so keep it synchronised (see *Installation*).
-* **Rate limit.** GeckoTerminal's limit is per IP. Each bot makes one OHLCV request per minute; initialising a 30-day coin takes ~45 requests, spaced 15 s apart.
+* **Rate limit.** GeckoTerminal's limit is per IP. Each bot makes one OHLCV request per minute; initialising a coin takes one request per 1000 minutes of history, spaced 15 s apart (~11 minutes for a 30-day coin).
 
 ### Trading modes
 
@@ -287,15 +299,21 @@ Chosen when the wallet is initialised (dashboard).
 
 ### Dashboard
 
-Served by `app.py` at `http://<host>:8050`. Per bot:
+Served by `app.py` at `http://<host>:8050`. A **System Overview** row shows the Pi's uptime, CPU and RAM, the SOL price, the number of active bots and the wallet mode. Below it are three tabs:
 
-* **Price chart** with buy and sell markers. While a position is open: the take-profit and loss-floor lines. After a sale: the re-entry line, which relaxes over time.
-* **Combo score** under the price, with its buy threshold, and a ribbon that marks every **candidate minute**; hovering shows all three scores.
-* **Buy readiness:** the entry conditions (combo, price position 15m / 1h, re-entry) and the take-profit, each against its threshold.
-* **Bot card:** current scores, take-profit, loss floor, stale time, phase and rebases; P&L, win rate, holding times, trade counts and fees; the CPU and RAM of the bot's process.
-* **Capital** over time (cash, open position, fees), trades, logs and a per-bot debug toggle.
+* **Overview:** a coloured status card per bot (status, coin, initial and current capital with P&L, position, completed trades, assigned time and the bot's controls), the **portfolio capital composition** chart (unallocated, initial capital, realized profit, open positions, and cumulative fees in their own pane), all bots' trade history and the pipeline terminal.
+* **Manage Bots:** per bot,
+  * a **price chart** in three panes: the model scores on top (P(move) red, P(direction) blue, and the combo orange and thicker, as the main score); the candles with buy and sell markers, the take-profit and loss-floor lines while a position is open, and the re-entry line after a sale, which relaxes over time; and the volume. Hovering shows all values of a minute;
+  * **buy readiness:** combo, price position 15m / 60m, re-entry and take-profit, each against its threshold;
+  * the **bot info card** (position, phase and rebases, capital, P&L, win rate, holding times, trade counts, fees, assigned time, the CPU and RAM of the bot's process);
+  * **capital composition & fees** over time, the bot's trades and its terminal, and a debug-logging toggle.
 
-Wallet-wide: total capital, SOL price, system stats (CPU, RAM, uptime) and all trades. Controls: pause, resume, deallocate, force sell immediately, force sell on the next sell signal, and stop all.
+  An unassigned bot shows the setup form instead: token address (symbol and image fetched from GeckoTerminal), pool address, allocation (percentage of the wallet or a SOL amount) and the price-impact cap.
+* **Analytics:** the one-time wallet setup (paper or shadow), the wallet status, the SOL distribution and a capital overview per bot.
+
+Controls per bot: pause, resume, deallocate, sell now, and sell on the next sell signal (both pause the bot after the sale).
+
+**Live updates.** The page refreshes when the live update stream reports a change, plus every 30 seconds for the elapsed-time fields; if the stream is down it polls every 5 seconds. Text and panels are only rewritten when their content changed, and charts are only redrawn when they have new data. The charts use Plotly, which the browser loads from its CDN.
 
 ---
 
@@ -320,12 +338,12 @@ Requires **Python 3.10+**. Built for a Linux host such as a Raspberry Pi (`app.p
 ```bash
 cd live_pipeline
 python3 -m venv venv && source venv/bin/activate      # optional
-pip install flask pandas numpy scipy xgboost numba requests psutil
+pip install flask pandas numpy scipy xgboost requests psutil
 ```
 
-> On a Raspberry Pi, `scipy`, `xgboost` or `numba` may lack a prebuilt wheel for your Python version. If `pip` falls back to a slow source build or fails, install them with the system package manager: `sudo apt install python3-scipy python3-xgboost python3-numba`.
+> On a Raspberry Pi, `scipy` or `xgboost` may lack a prebuilt wheel for your Python version. If `pip` falls back to a slow source build or fails, install them with the system package manager: `sudo apt install python3-scipy python3-xgboost`.
 
-Put the files of `strategy_results/live_artifacts/` into `live_pipeline/artifacts/`. The app creates `data/` (the database and per-bot folders) on its first start.
+Put the files of `strategy_results/live_artifacts/` into `live_pipeline/artifacts/`, and the printed `TUNED_PARAMS` into `strategy.py`. The app creates `data/` (the database and per-bot folders) on its first start. There are no database migrations: after a change to the schema, delete `data/trading_bots.db` and set the wallet and bots up again.
 
 **Clock synchronisation.** The bots time their reads with the system clock. Raspberry Pi OS syncs over NTP by default (`systemd-timesyncd`); check with `timedatectl` that `System clock synchronized: yes`. The Pi has no battery-backed clock, so its time is wrong after a boot until the first sync, and a VPN with a kill switch can delay that sync. `chrony` (`sudo apt install chrony`) syncs faster and keeps a tighter clock. If the app runs as a systemd service, let it wait for the first sync (`After=time-sync.target` and `systemd-time-wait-sync.service`).
 
@@ -333,7 +351,7 @@ The application runs on an 8 GB Raspberry Pi 5 with Raspberry Pi OS Lite (64-bit
 
 ## Usage
 
-Start the dashboard server from `live_pipeline/` (this also initialises or migrates the database, loads the strategy parameters and starts the SOL-price collector):
+Start the dashboard server from `live_pipeline/` (this also creates the database if it doesn't exist and starts the SOL-price collector):
 
 ```bash
 python app.py
@@ -342,11 +360,11 @@ python app.py
 Then open `http://<host>:8050` and:
 
 1. **Initialise the wallet:** a starting SOL amount and the mode (paper, or shadow with a wallet public key).
-2. **Add a bot** for a Solana pool (symbol + pool address). The manager starts a `bot_loop.py` process for it, which first fetches the coin's history (a few minutes for an older coin) and then runs every minute. It trades once the coin is 12 hours old.
-3. **Manage bots** from the dashboard: pause, resume, deallocate, force sell immediately, force sell on the next sell signal, or stop all.
+2. **Set up a bot** for a Solana pool on the Manage Bots tab (token address, pool address, allocation), then start it. The manager starts a `bot_loop.py` process for it, which first fetches the coin's full history (about 15 s per 1000 minutes) and then runs every minute. It can trade from the coin's first minute with features (minute 120).
+3. **Manage bots** from the dashboard: pause, resume, deallocate, sell now, or sell on the next sell signal.
 
 You never run `bot_loop.py` by hand; `bot_manager.py` launches it.
 
-**New models or parameters:** run the export cell of `strategy.ipynb`, replace the files in `live_pipeline/artifacts/` and restart the app. Running bots keep their parameters until they are restarted.
+**New models or parameters:** run the export cell of `strategy.ipynb`, replace the files in `live_pipeline/artifacts/`, paste the printed `TUNED_PARAMS` into `strategy.py` and restart the app. Running bots keep their parameters until they are restarted.
 
 **Coin selection:** the results describe coins that passed the screen above (liquidity, security score, age). Apply the same screen when choosing coins for the bots, or the results may not transfer.
