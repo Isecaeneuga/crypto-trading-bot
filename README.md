@@ -10,10 +10,10 @@
 6. [From the notebooks to the bot](#6-from-the-notebooks-to-the-bot)
 7. [The trading strategy](#7-the-trading-strategy)
 8. [Is the trading strategy profitable?](#8-is-the-trading-strategy-profitable)
-9. [Installation](#9-installation)
-10. [Usage](#10-usage)
-11. [Dashboard](#11-dashboard)
-12. [Live pipeline](#12-live-pipeline)
+9. [Dashboard](#9-dashboard)
+10. [Live pipeline](#10-live-pipeline)
+11. [Installation](#11-installation)
+12. [Usage](#12-usage)
 
 ---
 
@@ -83,7 +83,7 @@ This project uses some domain-specific terms.
 * **Candle / OHLCV:** one minute of trading. A candle holds the first price of the minute (open), the highest price reached within the minute (high), the lowest price (low) and the price when the minute ended (close). The volume is the amount traded within the minute; in this project it is expressed in SOL rather than in the meme coin itself.
 * **Move / pump:** a rise of at least 10% within the next 30 minutes. The move model estimates its probability.
 * **Direction:** whether the price first reaches +15% or −15% within the next 2 hours. The direction model estimates the probability that +15% comes first.
-* **Score / percentile:** in the research, a model output converted to its rank among the model's predictions on the tune split (0 = lowest, 1 = highest). All strategy thresholds are set on these percentiles, so they mean the same for any model. The live bot uses the equivalent raw cutoff (see [6.3](#63-the-models-and-scores)), so it needs no tune predictions.
+* **Score / percentile:** in the research, a model output converted to its rank among the model's predictions on the tune split (0 = lowest, 1 = highest). All strategy thresholds are set on these percentiles, so they mean the same for any model. The live bot uses the equivalent raw cutoff (see [6.2](#62-the-models-and-scores)), so it needs no tune predictions.
 * **Candidate minute:** a minute that passes the entry gate (the combo score and the price-position filters). Buys and rebases only happen on candidate minutes.
 * **Rebase / race:** the loss floor and the stale time never sell. Instead, they start a *race*: the position stays open and is re-anchored (rebased) at the next acceptable candidate minute, unless the take-profit comes first.
 * **Paper / shadow / live:** the same decisions with different fills. *Paper* simulates the fills with a fixed fee. *Shadow* asks Jupiter for a real swap quote at the moment of the decision and records that fill, without signing or sending anything. Live trading (real swaps) is not implemented yet, and shadow mode is not fully finished.
@@ -206,16 +206,7 @@ artifacts/
 
 A strategy is only valid with the models it was tuned on, because `combo_cutoff` is a score of exactly those models. The live pipeline and `profitability_visuals` therefore check the fingerprints and refuse a strategy file whose models don't match. Several strategies can sit side by side in `artifacts/`, as long as they were tuned on the same two models.
 
-### 6.2 Alignment with the notebooks
-
-The live code was checked against the notebooks' own code:
-
-* **Features:** all 169 values are identical to the notebook's `compute_coin_features_v9`. This was tested on a synthetic 12,000-minute coin with gaps and zero-volume minutes, both on the full history and minute by minute, and with the bot's Europe/Amsterdam timestamps across a daylight-saving change. The live version of the liquidity estimate, which updates minute by minute, gives the same values as the notebook's, also after a revised minute.
-* **Strategy:** the bot's decision logic, replayed minute by minute on 30 random synthetic coins, makes the same trades and ends with the same capital as the notebook's simulator. For this test, the simulator's 12-hour trading start was set to 0, because the live bot has none (see [7.1](#71-entry)).
-* **Fill rule:** identical to the cleaning notebook's, also when new minutes are appended to a stored history.
-* **Scores:** the models are loaded with their own feature lists and predict with `iteration_range=(0, best_iteration + 1)`, as in the research. The live scores have not yet been compared with the notebook's saved predictions from the real models.
-
-### 6.3 The models and scores
+### 6.2 The models and scores
 
 Two XGBoost models score every minute. They are loaded once when a bot starts, from the model folder (`global_settings.model_dir`, default `artifacts`), and predict with `iteration_range=(0, best_iteration + 1)`, as in the research. The buy score is the combo, P(move) × P(direction).
 
@@ -248,11 +239,7 @@ The simulations never buy in a coin's first 12 hours; the live bot can buy from 
 
 Within a minute, the order is: rebase check → take-profit → loss-floor / stale transitions. `strategy.py` documents the details; the research simulator in `strategy.ipynb` is the authority on the logic.
 
-### 7.3 No signal exit
-
-The research also tried a *signal exit*: selling when the direction or move score drops below a threshold. Its gains came from a look-ahead in the simulator (development log §35); with the simulator fixed, it added nothing, so the live bot has none.
-
-### 7.4 Parameters
+### 7.3 Parameters
 
 Each strategy file in `live_pipeline/artifacts/` holds one strategy's parameters. When a bot is set up, a dropdown picks its strategy (default: the first file by name), and the bot keeps it until it is deallocated. Strategy files can't be edited from the dashboard.
 
@@ -274,64 +261,7 @@ The same chart is also drawn live in the dashboard, for each bot and as an aggre
 
 ---
 
-## 9. Installation
-
-### 9.1 Notebooks
-
-Written with **Python 3.9.20**. Packages: pandas, numpy, numba, xgboost (≥ 2.0, for the `.ubj` model files), optuna, cmaes, scikit-learn, scipy, pyarrow, matplotlib and requests.
-
-```bash
-pip install pandas numpy numba "xgboost>=2.0" optuna cmaes scikit-learn scipy pyarrow matplotlib requests
-```
-
-* The XGBoost settings use `device: 'cuda'` (an NVIDIA GPU). Without one, set it to `'cpu'` in `model_search` (`PARAMS_FIXED`) and in `profitability_visuals` (`DEVICE`); training is then much slower.
-* Run the notebooks in `development_notebooks/` in the order of [4.1](#41-development-notebooks), each with **Run All**. Rough runtimes for about 400 coins: cleaning takes minutes, the dataset tens of minutes, `model_search` many hours and `strategy` hours.
-* Put the data in `data/` (`raw_data/`, or `processed_data/` and `dataset_v9/` if you skip steps); every other output appears in `research_development/`.
-* After `model_search` and after `strategy`, copy the chosen models and the strategy file into `live_pipeline/artifacts/` (see [6.1](#61-the-artifacts-folder)).
-
-### 9.2 Live pipeline
-
-Requires **Python 3.10+**. Built for a Linux host such as a Raspberry Pi (`app.py` reads `/proc/uptime` for the uptime display).
-
-```bash
-cd live_pipeline
-python3 -m venv venv && source venv/bin/activate      # optional
-pip install flask pandas numpy scipy xgboost requests psutil
-```
-
-> On a Raspberry Pi, `scipy` or `xgboost` may lack a prebuilt wheel for your Python version. If `pip` falls back to a slow source build or fails, install them with the system package manager: `sudo apt install python3-scipy python3-xgboost`.
-
-The app uses the models and strategy files in `live_pipeline/artifacts/`. On its first start it creates `live_pipeline/data/`, which holds the database and the per-bot folders and is not committed. There are no database migrations: after a change to the schema, delete `data/trading_bots.db` and set the wallet and the bots up again.
-
-**Clock synchronisation.** The bots time their reads with the system clock. Raspberry Pi OS syncs over NTP by default (`systemd-timesyncd`); check with `timedatectl` that it shows `System clock synchronized: yes`. The Pi has no battery-backed clock, so its time is wrong after a boot until the first sync, and a VPN with a kill switch can delay that sync. `chrony` (`sudo apt install chrony`) syncs faster and keeps a tighter clock. If the app runs as a systemd service, let it wait for the first sync (`After=time-sync.target` and `systemd-time-wait-sync.service`).
-
-The application runs on an 8 GB Raspberry Pi 5 with Raspberry Pi OS Lite (64-bit), without a desktop environment.
-
----
-
-## 10. Usage
-
-Start the dashboard server from `live_pipeline/`. This also creates the database if it doesn't exist and starts the SOL-price collector:
-
-```bash
-python app.py
-```
-
-Then open `http://<host>:8050` and:
-
-1. **Initialise the wallet:** a starting SOL amount and the mode (paper, or shadow with a wallet public key).
-2. **Set up a bot** for a Solana pool on the Manage Bots tab (token address, pool address, allocation and strategy), then start it. The manager starts a `bot_loop.py` process for it, which first fetches the coin's full history (about 15 s per 1,000 minutes) and then runs every minute. It can trade from the coin's first minute with features (minute 120).
-3. **Manage the bots** from the dashboard: pause, resume, deallocate, sell now, or sell on the next sell signal; or pause or resume all bots at once.
-
-You never run `bot_loop.py` by hand; `bot_manager.py` launches it.
-
-**New models or parameters:** copy the new files into `live_pipeline/artifacts/` (see [6.1](#61-the-artifacts-folder)). New strategy files appear in the setup dropdown straight away, and running bots keep their strategy until they are restarted. Strategy files tuned on other models than the ones in `artifacts/` show as unusable.
-
-**Coin selection:** the results describe coins that passed the screen in [4.4](#44-data) (liquidity, security score and age). Apply the same screen when choosing coins for the bots, or the results may not carry over.
-
----
-
-## 11. Dashboard
+## 9. Dashboard
 
 Served by `app.py` at `http://<host>:8050`. A **System Overview** row shows the Pi's uptime, CPU and RAM, the SOL price, the number of active bots with **Pause all** / **Resume all** buttons (each acts only on the bots that aren't already paused or running), and the wallet mode. Below it are three tabs:
 
@@ -356,9 +286,9 @@ The GIF below briefly shows the live dashboard in paper mode, with two bots runn
 
 ---
 
-## 12. Live pipeline
+## 10. Live pipeline
 
-### 12.1 Overview
+### 10.1 Overview
 
 What a bot does, from start to finish:
 
@@ -370,7 +300,7 @@ What a bot does, from start to finish:
 6. **Execution.** Paper or shadow fills (`execution.py`, `dex.py`).
 7. **Records.** The candles, scores, trades, capital and strategy state go to the SQLite database, which the dashboard reads from.
 
-### 12.2 Architecture
+### 10.2 Architecture
 
 The system is process-oriented: the web app and one worker process per bot coordinate only through a shared SQLite database. `bot_manager.py` launches each bot as its own `bot_loop.py` subprocess (`--bot-id N`). Up to 10 bots are supported.
 
@@ -400,7 +330,7 @@ A bot's strategy state (open position, phase, races, peak and re-entry bookkeepi
 
 The dashboard follows the database through a live update stream: `app.py` checks a set of change markers once a second and pushes them over `/api/stream` (Server-Sent Events), but only when something changed.
 
-### 12.3 Files
+### 10.3 Files
 
 | File | Responsibility |
 | --- | --- |
@@ -415,3 +345,60 @@ The dashboard follows the database through a live update stream: `app.py` checks
 | `dex.py` | Jupiter swap quotes and network-fee estimates for shadow mode (it never signs or sends anything) |
 | `database.py` | The SQLite schema, the queries, all persistence, and the change markers behind the live update stream |
 | `templates/dashboard.html` | The single-page frontend served by Flask (Plotly charts) |
+
+---
+
+## 11. Installation
+
+### 11.1 Notebooks
+
+Written with **Python 3.9.20**. Packages: pandas, numpy, numba, xgboost (≥ 2.0, for the `.ubj` model files), optuna, cmaes, scikit-learn, scipy, pyarrow, matplotlib and requests.
+
+```bash
+pip install pandas numpy numba "xgboost>=2.0" optuna cmaes scikit-learn scipy pyarrow matplotlib requests
+```
+
+* The XGBoost settings use `device: 'cuda'` (an NVIDIA GPU). Without one, set it to `'cpu'` in `model_search` (`PARAMS_FIXED`) and in `profitability_visuals` (`DEVICE`); training is then much slower.
+* Run the notebooks in `development_notebooks/` in the order of [4.1](#41-development-notebooks), each with **Run All**. Rough runtimes for about 400 coins: cleaning takes minutes, the dataset tens of minutes, `model_search` many hours and `strategy` hours.
+* Put the data in `data/` (`raw_data/`, or `processed_data/` and `dataset_v9/` if you skip steps); every other output appears in `research_development/`.
+* After `model_search` and after `strategy`, copy the chosen models and the strategy file into `live_pipeline/artifacts/` (see [6.1](#61-the-artifacts-folder)).
+
+### 11.2 Live pipeline
+
+Requires **Python 3.10+**. Built for a Linux host such as a Raspberry Pi (`app.py` reads `/proc/uptime` for the uptime display).
+
+```bash
+cd live_pipeline
+python3 -m venv venv && source venv/bin/activate      # optional
+pip install flask pandas numpy scipy xgboost requests psutil
+```
+
+> On a Raspberry Pi, `scipy` or `xgboost` may lack a prebuilt wheel for your Python version. If `pip` falls back to a slow source build or fails, install them with the system package manager: `sudo apt install python3-scipy python3-xgboost`.
+
+The app uses the models and strategy files in `live_pipeline/artifacts/`. On its first start it creates `live_pipeline/data/`, which holds the database and the per-bot folders and is not committed. There are no database migrations: after a change to the schema, delete `data/trading_bots.db` and set the wallet and the bots up again.
+
+**Clock synchronisation.** The bots time their reads with the system clock. Raspberry Pi OS syncs over NTP by default (`systemd-timesyncd`); check with `timedatectl` that it shows `System clock synchronized: yes`. The Pi has no battery-backed clock, so its time is wrong after a boot until the first sync, and a VPN with a kill switch can delay that sync. `chrony` (`sudo apt install chrony`) syncs faster and keeps a tighter clock. If the app runs as a systemd service, let it wait for the first sync (`After=time-sync.target` and `systemd-time-wait-sync.service`).
+
+The application runs on an 8 GB Raspberry Pi 5 with Raspberry Pi OS Lite (64-bit), without a desktop environment.
+
+---
+
+## 12. Usage
+
+Start the dashboard server from `live_pipeline/`. This also creates the database if it doesn't exist and starts the SOL-price collector:
+
+```bash
+python app.py
+```
+
+Then open `http://<host>:8050` and:
+
+1. **Initialise the wallet:** a starting SOL amount and the mode (paper, or shadow with a wallet public key).
+2. **Set up a bot** for a Solana pool on the Manage Bots tab (token address, pool address, allocation and strategy), then start it. The manager starts a `bot_loop.py` process for it, which first fetches the coin's full history (about 15 s per 1,000 minutes) and then runs every minute. It can trade from the coin's first minute with features (minute 120).
+3. **Manage the bots** from the dashboard: pause, resume, deallocate, sell now, or sell on the next sell signal; or pause or resume all bots at once.
+
+You never run `bot_loop.py` by hand; `bot_manager.py` launches it.
+
+**New models or parameters:** copy the new files into `live_pipeline/artifacts/` (see [6.1](#61-the-artifacts-folder)). New strategy files appear in the setup dropdown straight away, and running bots keep their strategy until they are restarted. Strategy files tuned on other models than the ones in `artifacts/` show as unusable.
+
+**Coin selection:** the results describe coins that passed the screen in [4.4](#44-data) (liquidity, security score and age). Apply the same screen when choosing coins for the bots, or the results may not carry over.
