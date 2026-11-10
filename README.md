@@ -1,6 +1,6 @@
 # Solana Meme-Coin Trading Bot
 
-An end-to-end machine-learning trading system for Solana meme coins. It collects 1-minute OHLCV candles from GeckoTerminal, builds a 169-feature dataset, trains two gradient-boosted models (a **move** model and a **direction** model), tunes a trading strategy on them in a causality-tested simulator, and runs that strategy live: many independent bots behind a web dashboard, in **paper** mode (simulated fills) or **shadow** mode (real Jupiter swap quotes, never sent).
+An end-to-end machine-learning trading system for Solana meme coins. It collects 1-minute OHLCV candles from GeckoTerminal, builds a 169-feature dataset, trains two gradient-boosted models on 146 of those features each (a **move** model and a **direction** model), tunes a trading strategy on them in a causality-tested simulator, and runs that strategy live: many independent bots behind a web dashboard, in **paper** mode (simulated fills) or **shadow** mode (real Jupiter swap quotes, never sent).
 
 The repository has three parts:
 
@@ -19,6 +19,7 @@ The repository has three parts:
 ```
 ├── README.md
 ├── development_log.md
+├── .gitignore
 ├── development_notebooks/         the pipeline, run in this order
 │   ├── meme_coin_pipeline.ipynb
 │   ├── data_cleaning.ipynb
@@ -26,22 +27,32 @@ The repository has three parts:
 │   ├── model_search.ipynb
 │   └── strategy.ipynb
 ├── research_notebooks/            studies outside the pipeline
+│   ├── readme_visuals/            the README's images
 │   ├── finalization_study.ipynb
 │   └── profitability_visuals.ipynb
-└── live_pipeline/                 the trading application
-    ├── app.py
-    ├── bot_manager.py
-    ├── bot_loop.py
-    ├── data_collection.py
-    ├── features.py
-    ├── scoring.py
-    ├── strategy.py
-    ├── execution.py
-    ├── dex.py
-    ├── database.py
-    ├── templates/                 the dashboard page
-    │   └── dashboard.html
-    └── artifacts/                 the two models
+├── live_pipeline/                 the trading application
+│   ├── app.py
+│   ├── bot_manager.py
+│   ├── bot_loop.py
+│   ├── data_collection.py
+│   ├── features.py
+│   ├── scoring.py
+│   ├── strategy.py
+│   ├── execution.py
+│   ├── dex.py
+│   ├── database.py
+│   ├── templates/                 the dashboard page
+│   │   └── dashboard.html
+│   └── artifacts/                 the chosen models and strategy files
+├── data/                          the data (not committed)
+│   ├── raw_data/
+│   ├── processed_data/
+│   └── dataset_v9/
+└── research_development/          the notebooks' outputs (not committed)
+    ├── model_search/
+    ├── strategy_results/
+    ├── finalization_data/
+    └── readme_visuals/
 ```
 
 ---
@@ -70,17 +81,17 @@ The repository has three parts:
 
 ## Development notebooks
 
-The pipeline that produced the dataset, the models and the strategy parameters. Every notebook is resumable (finished work is skipped) and writes into its own output folder.
+The pipeline that produced the dataset, the models and the strategy parameters. Every notebook is resumable (finished work is skipped).
 
 | # | Notebook | Reads | Writes | What it does |
 |---|---|---|---|---|
-| 1 | [`meme_coin_pipeline`](development_notebooks/meme_coin_pipeline.ipynb) | GeckoTerminal API, `COIN_LIST` | `raw_data/` | Collects 1-minute OHLCV per pool, applies the fill rule, stops collecting a coin at its death point (48 h window < 1,000 SOL volume, after a 48 h grace) and marks it dead. |
-| 2 | [`data_cleaning`](development_notebooks/data_cleaning.ipynb) | `raw_data/` (never modified) | `processed_data/` | The fill rule again, a volume death mark and a pump-rate (label) death mark, cut at the earlier one; leaves out coins with less than 12 h of data. |
-| 3 | [`Dataset_creationV9`](development_notebooks/Dataset_creationV9.ipynb) | `processed_data/` | `dataset_v9/` | 169 causal features and the labels for every minute, a **leakage test** on all features, and a stratified coin-level split into 5 splits. |
-| 4 | [`model_search`](development_notebooks/model_search.ipynb) | `dataset_v9/splits`, `processed_data/` | `model_search/` | Optuna searches for the move and the direction model (validation metric minus a model-size penalty); the top 10 of each are then judged in strategy simulations, and the pair is picked there. |
-| 5 | [`strategy`](development_notebooks/strategy.ipynb) | `model_results/` (the chosen pair), `dataset_v9/splits`, `processed_data/` | `strategy_results/` | 50 strategy optimisations (optimised on tune, selected on val_tune), each evaluated **once** on test; the last cell exports the live artifacts. |
+| 1 | [`meme_coin_pipeline`](development_notebooks/meme_coin_pipeline.ipynb) | GeckoTerminal API, `COIN_LIST` | `data/raw_data/` | Collects 1-minute OHLCV per pool, applies the fill rule, stops collecting a coin at its death point (48 h window < 1,000 SOL volume, after a 48 h grace) and marks it dead. |
+| 2 | [`data_cleaning`](development_notebooks/data_cleaning.ipynb) | `data/raw_data/` (never modified) | `data/processed_data/` | The fill rule again, a volume death mark and a pump-rate (label) death mark, cut at the earlier one; leaves out coins with less than 12 h of data. |
+| 3 | [`Dataset_creationV9`](development_notebooks/Dataset_creationV9.ipynb) | `data/processed_data/` | `data/dataset_v9/` | 169 causal features and the labels for every minute, a **leakage test** on all features, and a stratified coin-level split into 5 splits. |
+| 4 | [`model_search`](development_notebooks/model_search.ipynb) | `data/dataset_v9/splits`, `data/processed_data/` | `research_development/model_search/` | Optuna searches for the move and the direction model (validation metric minus a model-size penalty); the top 10 of each are then judged in strategy simulations, and the pair is picked there. |
+| 5 | [`strategy`](development_notebooks/strategy.ipynb) | `live_pipeline/artifacts/` (the chosen pair), `data/dataset_v9/splits`, `data/processed_data/` | `research_development/strategy_results/` | `N_RUNS` strategy optimisations (optimised on tune, selected on val_tune), each evaluated **once** on test; the run with the best `SELECT_BY` score (test) is exported as a named strategy file. |
 
-The notebooks create their data folders (`raw_data/`, `processed_data/`, `dataset_v9/`, `model_search/`, `model_results/`, `strategy_results/`) next to themselves. The data and the trained artifacts are not part of the repository.
+**Folders.** Every notebook finds the repository's top folder by itself, so it runs from wherever Jupyter starts. It reads and writes its data in `data/` (`raw_data/`, `processed_data/`, `dataset_v9/`) and its other outputs in `research_development/`, in the output folders it always used (`model_search/`, `strategy_results/`, `finalization_data/`, `readme_visuals/`); neither folder is committed. The notebooks that use the chosen models (`strategy`, `profitability_visuals`) read them from `live_pipeline/artifacts/`, together with the strategy files; what goes into that folder is copied there by hand (see *From the notebooks to the bot*).
 
 **Data.** 402 coins, collected by hand-picking pools that met a fixed screen when added: Solana, at least $20k liquidity, GeckoTerminal security score ≥ 50, between 12 hours and 3 months old. Prices and volume are in SOL. development log §0.4 documents the data's provenance and every alteration.
 
@@ -97,14 +108,16 @@ The notebooks create their data folders (`raw_data/`, `processed_data/`, `datase
 * **Volatility:** several horizons, its dynamics (change, clustering, trend) and context (percentile, intraday pattern).
 * **Volume:** ratios, z-scores, dispersion, autocorrelation, skewness, concentration, volume × volatility.
 * **Momentum:** returns from 1 minute to 3 days, all-time-high distance, price positions within the last 15 minutes to 24 hours.
-* **Pump dynamics:** two pump definitions (one per model), each with clustering, velocity, density, failure rate and time between pumps.
+* **Pump dynamics:** two pump definitions (one per model: +10% within 30 minutes for the move model, +15% within 2 hours for the direction model), 23 features each: clustering, velocity, density, failure rate and time between pumps.
 * **Liquidity:** a causal estimate of the SOL needed for a 1% price impact (`estimated_sol_1pct_impact`), its age and uncertainty, liquidity trends.
+
+Each model uses **146** of the 169 features: the 123 that both share, plus its own pump set of 23. The other model's pump set is left out.
 
 **Labels.** `label_10pct_30m` (move model), `label_fpclass_15pct_2h` (direction model: up first / down first / neither) and `label_meta_minutes_to_end` (training rows need ≥ 240 minutes of future; never a feature).
 
 **The models.**
-* The **move** model predicts P(close rises ≥ 10% within 30 minutes).
-* The **direction** model predicts P(+15% is reached before −15% within 2 hours). It is trained **only on candidate minutes**: tradable, move score in its top 50%, and an outcome within 2 hours. This "A50" recipe was the single biggest model-side improvement found (development log §21–22).
+* The **move** model predicts P(close rises ≥ 10% within 30 minutes), from 146 features (the shared ones and the +10% / 30 min pump set).
+* The **direction** model predicts P(+15% is reached before −15% within 2 hours), from 146 features (the shared ones and the +15% / 2 h pump set). It is trained **only on candidate minutes**: tradable, move score in its top 50%, and an outcome within 2 hours. This "A50" recipe was the single biggest model-side improvement found (development log §21–22).
 * The buy score (**combo**) is the tune percentile of P(move) × P(direction).
 
 ### Evaluation rules
@@ -120,11 +133,12 @@ Two pitfalls shaped these rules. First, a simulator rule applied after the fact 
 
 ---
 
-## Research notebook
+## Research notebooks
 
 | Notebook | Purpose |
 |---|---|
-| [`finalization_study`](research_notebooks/finalization_study.ipynb) | **When is a live candle final?** The dataset's candles were collected long after the fact, but the live bot reads a minute seconds after it ends. The study reads the just-ended candle at 1.0, 1.5, … 40 s after its close (a sweep of 79 offsets within GeckoTerminal's rate limit) and compares each read with the value 5 minutes later. It checks the computer's clock against the server's `Date` header on every call, survives restarts, and logs every rate-limit hit. A standalone statistics cell reports, per field and for the whole candle, the earliest second at which 95 / 99 / 99.9% of candles are final. |
+| [`profitability_visuals`](research_notebooks/profitability_visuals.ipynb) | Simulates a strategy file from `live_pipeline/artifacts/` on the test coins with the live pipeline's decision code and draws the README's charts: final capital per coin, and the capital of one coin over time. Writes to `research_development/readme_visuals/`; copy the charts for the README into `research_notebooks/readme_visuals/`, which is committed. |
+| [`finalization_study`](research_notebooks/finalization_study.ipynb) | **When is a live candle final?** The dataset's candles were collected long after the fact, but the live bot reads a minute seconds after it ends. The study reads the just-ended candle at 1.0, 1.5, … 40 s after its close (a sweep of 79 offsets within GeckoTerminal's rate limit) and compares each read with the value 5 minutes later. It checks the computer's clock against the server's `Date` header on every call, survives restarts, and logs every rate-limit hit. A standalone statistics cell reports, per field and for the whole candle, the earliest second at which 95 / 99 / 99.9% of candles are final. Writes to `research_development/finalization_data/`. |
 
 **First reading** (one coin, about one day; development log §40.8): candles become final much later than expected. At 1–3 s almost no candle is final; at 38–40 s about half are. More coins and a longer sweep are needed before the live read time is set from it.
 
@@ -161,7 +175,7 @@ What a bot does, end to end:
 
 1. **History.** On its first start it fetches the coin's full minute history from GeckoTerminal, paging backwards 1000 candles per request (15 s apart) until the API has nothing older, and applies the fill rule. The history must start at the coin's first candle, because several features (minutes since launch, the launch and all-time-high features, the liquidity estimate) are anchored to it, so a page that fails after its retries stops the bot with an error instead of running on a partial history.
 2. **Every minute** it fetches the newest candles, re-checks the previous minute for late revisions, and appends the new minutes to the history with the same fill rule.
-3. **Features.** It computes the 169 features for the new minute(s) with the dataset notebook's own code (`features.py`).
+3. **Features.** It computes the 169 features for the new minute(s) with the dataset notebook's own code (`features.py`); each model reads its own 146 of them.
 4. **Scores.** The move and direction models predict; their product is the *combo* score (`scoring.py`).
 5. **Strategy.** The A50 state machine (`strategy.py`) decides: buy, sell, rebase or nothing.
 6. **Execution.** Paper or shadow fills (`execution.py`, `dex.py`).
@@ -207,7 +221,7 @@ The dashboard follows the database through a live update stream: `app.py` checks
 | `data_collection.py` | GeckoTerminal OHLCV fetching (full history, the gap after a restart, live minutes), rate-limit handling, the fill rule |
 | `features.py` | The feature code of `Dataset_creationV9`, copied verbatim without the labels, plus an incremental version of the liquidity estimate and the per-bot `LiveFeatureEngine` |
 | `scoring.py` | Loads the two models and computes P(move), P(direction) and the combo score |
-| `strategy.py` | The A50 strategy as a minute-by-minute state machine, its hard-coded parameters and its fill prices |
+| `strategy.py` | The A50 strategy as a minute-by-minute state machine, the strategy files (parameters) and the fill prices |
 | `execution.py` | Buy and sell execution: paper and shadow (live stubbed) |
 | `dex.py` | Jupiter swap quotes and network-fee estimates for shadow mode (never signs or sends) |
 | `database.py` | SQLite schema, queries, all persistence, and the change markers behind the live update stream |
@@ -215,14 +229,19 @@ The dashboard follows the database through a live update stream: `app.py` checks
 
 ### From the notebooks to the bot
 
-The last cell of `strategy.ipynb` copies the two chosen models to `strategy_results/live_artifacts/`; copy them into `live_pipeline/artifacts/`:
+`live_pipeline/artifacts/` holds what the live pipeline and the notebooks after `model_search` use. It is filled by hand:
 
 ```
 artifacts/
-└── move.ubj, direction.ubj    the chosen models (each file carries its feature list)
+├── move.ubj, move.json              the chosen move model and its _params.json
+├── direction.ubj, direction.json    the chosen direction model and its _params.json
+└── strategy_<name>.json             one file per strategy
 ```
 
-The same cell prints the parameters of the best val run as a `TUNED_PARAMS` block, including `combo_cutoff`; they are hard-coded in `strategy.py`. The models and the parameters must come from the same run of the notebook, because the parameters were tuned on these models' scores.
+1. `model_search` names the chosen pair at the end. Copy the two models from `research_development/model_search/` into `artifacts/` as `move.ubj` + `move.json` and `direction.ubj` + `direction.json` (the `.json` files are the models' `_params.json`).
+2. `strategy` loads the models from `artifacts/`. Its last cell writes the chosen run as `strategy_<STRATEGY_NAME>.json` into `research_development/strategy_results/`: the parameters, the raw `combo_cutoff`, the simulation settings and fingerprints (sha256) of the two models. Copy that file into `artifacts/`.
+
+A strategy is only valid with the models it was tuned on, because `combo_cutoff` is a score of those models. The live pipeline and `profitability_visuals` check the fingerprints and refuse a strategy file whose models don't match; several strategies can sit side by side in `artifacts/` as long as they were tuned on the same two models.
 
 **Alignment with the notebooks.** The live code was checked against the notebooks' own code:
 * **Features:** all 169 values are identical to `compute_coin_features_v9` on a synthetic 12,000-minute coin with gaps and zero-volume minutes, both on the full history and minute by minute on the history up to each minute, with the bot's Europe/Amsterdam timestamps across a daylight-saving change. The incremental liquidity estimate gives the same values as the notebook's function, also after a revised minute.
@@ -238,7 +257,7 @@ In the research the buy threshold is a percentile: `confidence_threshold = 0.861
 
 ### The trading strategy: A50, rebase mode
 
-One position per coin, evaluated once per closed minute. The tuned parameters are hard-coded in `strategy.py` (`TUNED_PARAMS`).
+One position per coin, evaluated once per closed minute. The tuned parameters come from the bot's strategy file in `live_pipeline/artifacts/`.
 
 **Entry.** Buy at the close (plus slippage) when all of these hold:
 
@@ -263,7 +282,7 @@ Within a minute the order is: rebase check → take-profit → loss floor / stal
 
 **Slippage** of 1.5% per side in paper mode (`static_trading_fee_pct`), as in the simulations: on the high side on purpose, to keep paper results pessimistic.
 
-**Parameters.** The parameters are hard-coded in `strategy.py` (`TUNED_PARAMS`, the best-on-val run of `strategy.ipynb`). The dashboard reads them from `/api/config/strategy`, which is read-only. To change them, edit `strategy.py` and restart the bots.
+**Parameters.** Each strategy file in `live_pipeline/artifacts/` holds one strategy's parameters. When a bot is set up, a dropdown picks its strategy (default: the first file by name); the bot keeps it until it is deallocated. Strategy files can't be edited from the dashboard. The table shows the values of `strategy_max_capital.json`:
 
 | Parameter | Value | Search range |
 | --- | --- | --- |
@@ -308,16 +327,16 @@ Chosen when the wallet is initialised (dashboard).
 
 ### Dashboard
 
-Served by `app.py` at `http://<host>:8050`. A **System Overview** row shows the Pi's uptime, CPU and RAM, the SOL price, the number of active bots and the wallet mode. Below it are three tabs:
+Served by `app.py` at `http://<host>:8050`. A **System Overview** row shows the Pi's uptime, CPU and RAM, the SOL price, the number of active bots with **Pause all** / **Resume all** buttons (each acts only on the bots that aren't paused or running yet), and the wallet mode. Below it are three tabs:
 
 * **Overview:** a coloured status card per bot (status, coin, initial and current capital with P&L, position, completed trades, assigned time and the bot's controls), the **portfolio capital composition** chart (unallocated, initial capital, realized profit, open positions, and cumulative fees in their own pane), all bots' trade history and the pipeline terminal.
 * **Manage Bots:** per bot,
   * a **price chart** in three panes: the model scores on top (P(move) red, P(direction) blue, and the combo orange and thicker, as the main score); the candles with buy and sell markers, the take-profit and loss-floor lines while a position is open, and the re-entry line after a sale, which relaxes over time; and the volume. Hovering shows all values of a minute;
   * **buy readiness:** combo, price position 15m / 60m, re-entry and take-profit, each against its threshold;
-  * the **bot info card** (position, phase and rebases, capital, P&L, win rate, holding times, trade counts, fees, assigned time, the CPU and RAM of the bot's process);
+  * the **bot info card** (strategy, position, phase and rebases, capital, P&L, win rate, holding times, trade counts, fees, assigned time, the CPU and RAM of the bot's process);
   * **capital composition & fees** over time, the bot's trades and its terminal, and a debug-logging toggle.
 
-  An unassigned bot shows the setup form instead: token address (symbol and image fetched from GeckoTerminal), pool address, allocation (percentage of the wallet or a SOL amount) and the price-impact cap.
+  An unassigned bot shows the setup form instead: token address (symbol and image fetched from GeckoTerminal), pool address, allocation (percentage of the wallet or a SOL amount), the strategy (a dropdown of the strategy files in `artifacts/`) and the price-impact cap.
 * **Analytics:** the one-time wallet setup (paper or shadow), the wallet status, the SOL distribution and a capital overview per bot.
 
 Controls per bot: pause, resume, deallocate, sell now, and sell on the next sell signal (both pause the bot after the sale).
@@ -338,7 +357,8 @@ pip install pandas numpy numba "xgboost>=2.0" optuna cmaes scikit-learn scipy py
 
 * The XGBoost settings use `device: 'cuda'` (an NVIDIA GPU). Without one, set it to `'cpu'` in `model_search` (`PARAMS_FIXED`); training is then much slower.
 * Run the notebooks from `development_notebooks/` in the order above, each with **Run All**. Rough runtimes for ~400 coins: cleaning minutes, dataset tens of minutes, `model_search` many hours, `strategy` hours.
-* `model_search` names the chosen pair at the end; copy the two `.ubj` files (and their `_params.json`) from `model_search/` to `model_results/` before running `strategy`.
+* Put the data in `data/` (`raw_data/`, or `processed_data/` and `dataset_v9/` if you skip steps); every other output appears in `research_development/`.
+* After `model_search` and after `strategy`, copy the chosen models and the strategy file into `live_pipeline/artifacts/` (see *From the notebooks to the bot*).
 
 ### Live pipeline
 
@@ -352,7 +372,7 @@ pip install flask pandas numpy scipy xgboost requests psutil
 
 > On a Raspberry Pi, `scipy` or `xgboost` may lack a prebuilt wheel for your Python version. If `pip` falls back to a slow source build or fails, install them with the system package manager: `sudo apt install python3-scipy python3-xgboost`.
 
-Put the files of `strategy_results/live_artifacts/` into `live_pipeline/artifacts/`, and the printed `TUNED_PARAMS` into `strategy.py`. The app creates `data/` (the database and per-bot folders) on its first start. There are no database migrations: after a change to the schema, delete `data/trading_bots.db` and set the wallet and bots up again.
+The app uses the models and strategy files in `live_pipeline/artifacts/`. It creates `live_pipeline/data/` (the database and per-bot folders, not committed) on its first start. There are no database migrations: after a change to the schema, delete `data/trading_bots.db` and set the wallet and bots up again.
 
 **Clock synchronisation.** The bots time their reads with the system clock. Raspberry Pi OS syncs over NTP by default (`systemd-timesyncd`); check with `timedatectl` that `System clock synchronized: yes`. The Pi has no battery-backed clock, so its time is wrong after a boot until the first sync, and a VPN with a kill switch can delay that sync. `chrony` (`sudo apt install chrony`) syncs faster and keeps a tighter clock. If the app runs as a systemd service, let it wait for the first sync (`After=time-sync.target` and `systemd-time-wait-sync.service`).
 
@@ -369,11 +389,11 @@ python app.py
 Then open `http://<host>:8050` and:
 
 1. **Initialise the wallet:** a starting SOL amount and the mode (paper, or shadow with a wallet public key).
-2. **Set up a bot** for a Solana pool on the Manage Bots tab (token address, pool address, allocation), then start it. The manager starts a `bot_loop.py` process for it, which first fetches the coin's full history (about 15 s per 1000 minutes) and then runs every minute. It can trade from the coin's first minute with features (minute 120).
-3. **Manage bots** from the dashboard: pause, resume, deallocate, sell now, or sell on the next sell signal.
+2. **Set up a bot** for a Solana pool on the Manage Bots tab (token address, pool address, allocation, strategy), then start it. The manager starts a `bot_loop.py` process for it, which first fetches the coin's full history (about 15 s per 1000 minutes) and then runs every minute. It can trade from the coin's first minute with features (minute 120).
+3. **Manage bots** from the dashboard: pause, resume, deallocate, sell now, or sell on the next sell signal; or pause or resume all bots at once.
 
 You never run `bot_loop.py` by hand; `bot_manager.py` launches it.
 
-**New models or parameters:** run the export cell of `strategy.ipynb`, replace the files in `live_pipeline/artifacts/`, paste the printed `TUNED_PARAMS` into `strategy.py` and restart the app. Running bots keep their parameters until they are restarted.
+**New models or parameters:** copy the new files into `live_pipeline/artifacts/` (see *From the notebooks to the bot*). New strategy files appear in the setup dropdown at once; running bots keep their strategy until they are restarted. Strategy files tuned on other models than the ones in `artifacts/` show as unusable.
 
 **Coin selection:** the results describe coins that passed the screen above (liquidity, security score, age). Apply the same screen when choosing coins for the bots, or the results may not transfer.
