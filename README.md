@@ -8,7 +8,7 @@ The repository has three parts:
 * **Research notebook:** a measurement study for the live pipeline (when is a 1-minute candle final?).
 * **Live pipeline:** the multi-bot application (Python back end and a single-page dashboard) that runs on a Raspberry Pi.
 
-[`FINDINGS.md`](FINDINGS.md) is the project's running log: every experiment, its result and the decision taken, from the first label search to the current pipeline. Its §0 is the project guide.
+[`development_log.md`](development_log.md) is the project's running log: every experiment, its result and the decision taken, from the first label search to the current pipeline. Its §0 is the project guide.
 
 > **Headline (current notebook output, first 30 of 50 strategy runs):** from $20 per coin, the run that was best on validation ends at **$43.76 per coin on 100 unseen test coins** (2.2×). The mean over all runs is $47.74 on test. These are simulated results with 1.5% slippage per side; no real money has been traded.
 
@@ -18,24 +18,31 @@ The repository has three parts:
 
 ```
 ├── README.md
-├── FINDINGS.md                    the research log (project guide in §0)
+├── development_log.md
 ├── development_notebooks/         the pipeline, run in this order
-│   ├── meme_coin_pipeline.ipynb   1  data collection
-│   ├── data_cleaning.ipynb        2  fill rule, death points, short coins
-│   ├── Dataset_creationV9.ipynb   3  features, labels, splits
-│   ├── model_search.ipynb         4  move + direction model search
-│   └── strategy.ipynb             5  strategy optimisation, test evaluation, live export
-├── research_notebooks/
-│   └── finalization_study.ipynb   when a GeckoTerminal candle stops changing
+│   ├── meme_coin_pipeline.ipynb
+│   ├── data_cleaning.ipynb
+│   ├── Dataset_creationV9.ipynb
+│   ├── model_search.ipynb
+│   └── strategy.ipynb
+├── research_notebooks/            studies outside the pipeline
+│   ├── finalization_study.ipynb
+│   └── profitability_visuals.ipynb
 └── live_pipeline/                 the trading application
-    ├── app.py  bot_manager.py  bot_loop.py
-    ├── data_collection.py  features.py  scoring.py  strategy.py
-    ├── execution.py  dex.py  database.py
-    ├── templates/dashboard.html
-    └── artifacts/                 the two models (from notebook 5)
+    ├── app.py
+    ├── bot_manager.py
+    ├── bot_loop.py
+    ├── data_collection.py
+    ├── features.py
+    ├── scoring.py
+    ├── strategy.py
+    ├── execution.py
+    ├── dex.py
+    ├── database.py
+    ├── templates/                 the dashboard page
+    │   └── dashboard.html
+    └── artifacts/                 the two models
 ```
-
-The notebooks create their data folders (`raw_data/`, `processed_data/`, `dataset_v9/`, `model_search/`, `model_results/`, `strategy_results/`) next to themselves. The data and the trained artifacts are not part of the repository.
 
 ---
 
@@ -73,7 +80,9 @@ The pipeline that produced the dataset, the models and the strategy parameters. 
 | 4 | [`model_search`](development_notebooks/model_search.ipynb) | `dataset_v9/splits`, `processed_data/` | `model_search/` | Optuna searches for the move and the direction model (validation metric minus a model-size penalty); the top 10 of each are then judged in strategy simulations, and the pair is picked there. |
 | 5 | [`strategy`](development_notebooks/strategy.ipynb) | `model_results/` (the chosen pair), `dataset_v9/splits`, `processed_data/` | `strategy_results/` | 50 strategy optimisations (optimised on tune, selected on val_tune), each evaluated **once** on test; the last cell exports the live artifacts. |
 
-**Data.** 402 coins, collected by hand-picking pools that met a fixed screen when added: Solana, at least $20k liquidity, GeckoTerminal security score ≥ 50, between 12 hours and 3 months old. Prices and volume are in SOL. FINDINGS §0.4 documents the data's provenance and every alteration.
+The notebooks create their data folders (`raw_data/`, `processed_data/`, `dataset_v9/`, `model_search/`, `model_results/`, `strategy_results/`) next to themselves. The data and the trained artifacts are not part of the repository.
+
+**Data.** 402 coins, collected by hand-picking pools that met a fixed screen when added: Solana, at least $20k liquidity, GeckoTerminal security score ≥ 50, between 12 hours and 3 months old. Prices and volume are in SOL. development log §0.4 documents the data's provenance and every alteration.
 
 **Splits (by coin).** Coins are stratified by length × pump rate into 15 / 10 / 25 / 25 / 25%:
 
@@ -95,12 +104,12 @@ The pipeline that produced the dataset, the models and the strategy parameters. 
 
 **The models.**
 * The **move** model predicts P(close rises ≥ 10% within 30 minutes).
-* The **direction** model predicts P(+15% is reached before −15% within 2 hours). It is trained **only on candidate minutes**: tradable, move score in its top 50%, and an outcome within 2 hours. This "A50" recipe was the single biggest model-side improvement found (FINDINGS §21–22).
+* The **direction** model predicts P(+15% is reached before −15% within 2 hours). It is trained **only on candidate minutes**: tradable, move score in its top 50%, and an outcome within 2 hours. This "A50" recipe was the single biggest model-side improvement found (development log §21–22).
 * The buy score (**combo**) is the tune percentile of P(move) × P(direction).
 
 ### Evaluation rules
 
-The rules every experiment followed (FINDINGS §0.7):
+The rules every experiment followed (development log §0.7):
 * a **leakage test** for features: values must be identical with and without future data;
 * a **causality test** for every simulator change: a coin simulated on its full data and on data cut at minute C must give identical trades before C;
 * **controls** (shuffled scores, random blocks) for any rule that skips or changes trades;
@@ -117,13 +126,13 @@ Two pitfalls shaped these rules. First, a simulator rule applied after the fact 
 |---|---|
 | [`finalization_study`](research_notebooks/finalization_study.ipynb) | **When is a live candle final?** The dataset's candles were collected long after the fact, but the live bot reads a minute seconds after it ends. The study reads the just-ended candle at 1.0, 1.5, … 40 s after its close (a sweep of 79 offsets within GeckoTerminal's rate limit) and compares each read with the value 5 minutes later. It checks the computer's clock against the server's `Date` header on every call, survives restarts, and logs every rate-limit hit. A standalone statistics cell reports, per field and for the whole candle, the earliest second at which 95 / 99 / 99.9% of candles are final. |
 
-**First reading** (one coin, about one day; FINDINGS §40.8): candles become final much later than expected. At 1–3 s almost no candle is final; at 38–40 s about half are. More coins and a longer sweep are needed before the live read time is set from it.
+**First reading** (one coin, about one day; development log §40.8): candles become final much later than expected. At 1–3 s almost no candle is final; at 38–40 s about half are. More coins and a longer sweep are needed before the live read time is set from it.
 
 ---
 
 ## Results
 
-All from the saved notebook outputs on the rebuilt data (FINDINGS §42).
+All from the saved notebook outputs on the rebuilt data (development log §42).
 
 **Model search** (val_tune, 10 strategy runs per model):
 
@@ -250,7 +259,7 @@ The buy size is the bot's capital, capped so that the buy stays within the price
 
 Within a minute the order is: rebase check → take-profit → loss floor / stale transitions. `strategy.py` documents the details; the research simulator in `strategy.ipynb` is the authority on the logic.
 
-**No signal exit.** The research also tried a *signal exit* (sell when the direction or move score drops below a threshold). Its gains came from a look-ahead in the simulator (FINDINGS §35); with the simulator fixed it added nothing, so the live bot has none.
+**No signal exit.** The research also tried a *signal exit* (sell when the direction or move score drops below a threshold). Its gains came from a look-ahead in the simulator (development log §35); with the simulator fixed it added nothing, so the live bot has none.
 
 **Slippage** of 1.5% per side in paper mode (`static_trading_fee_pct`), as in the simulations: on the high side on purpose, to keep paper results pessimistic.
 
