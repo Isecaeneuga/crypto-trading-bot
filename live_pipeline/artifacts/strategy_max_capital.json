@@ -1,0 +1,48 @@
+{
+  "format": "bot-strategy/1",
+  "name": "max_capital",
+  "created_utc": "2026-11-10 15:19:54",
+  "params": {
+    "confidence_threshold": 0.8258660989210341,
+    "max_price_position_15m": 0.2382788847833296,
+    "max_price_position_60m": 0.4924074850501273,
+    "activation_threshold": 0.24077298866081487,
+    "stale_trade_minutes": 729,
+    "reentry_threshold_pct": 0.19784569224584603,
+    "loss_floor_pct": 0.2513491375821403,
+    "reentry_decay_rate": 0.007211355881724047,
+    "reentry_decay_start_minutes": 143,
+    "loss_floor_consecutive_minutes": 7
+  },
+  "combo_cutoff": 0.3289652466773987,
+  "models": {
+    "move": {
+      "file": "move.ubj",
+      "sha256": "cf5f20181fcb0859b7cba549546746ee7f3627567c4952dc90e08bf0d2088e4c"
+    },
+    "direction": {
+      "file": "direction.ubj",
+      "sha256": "e6f51339deded8cb2248b120483627ba9d294aa8c5ddc8480fe06aaa71f11f29"
+    }
+  },
+  "simulation": {
+    "initial_capital_usd": 20,
+    "sol_price_usd": 130.0,
+    "slippage_pct": 0.015,
+    "desired_price_impact_pct": 0.00333,
+    "target_fill_pct": 1,
+    "exit_mode": "rebase",
+    "trading_start_minutes": 720,
+    "score_capital_ceiling_x": 10,
+    "score_mode": "capped"
+  },
+  "selection": {
+    "selected_by": "test",
+    "run": 57,
+    "n_runs": 100,
+    "val_score": 49.20904233044386,
+    "test_score": 54.617427785876096,
+    "mean_test_score_over_runs": 47.440787355522424,
+    "runs_file": "runs_move__direction__rebase.json"
+  }
+}

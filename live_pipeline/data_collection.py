@@ -1,8 +1,9 @@
 """
 Data Collection - Handles all GeckoTerminal API interaction.
 
-Fetches historical and live OHLCV data, handles rate limiting and retries,
-and forward-fills missing minutes. No database access, no trading logic.
+Fetches the full available OHLCV history and live candles, handles rate limiting
+and retries, and fills missing / zero-volume minutes exactly as the data notebooks
+(meme_coin_pipeline, data_cleaning). No database access, no trading logic.
 """
 
 import time
@@ -14,157 +15,130 @@ BASE_URL = "https://api.geckoterminal.com/api/v2"
 NETWORK = "solana"
 
 
-def fetch_historical_ohlcv(pool_address, num_batches, timezone, bot_id):
-    """
-    Fetch historical 1-minute OHLCV data in batches, paginating backwards.
-    Returns a sorted, de-duplicated DataFrame or None if no data retrieved.
+def _ohlcv_list_to_df(ohlcv_list, timezone):
+    """Raw GeckoTerminal ohlcv_list -> sorted, de-duplicated DataFrame (the pipeline's _raw_to_df)."""
+    df = pd.DataFrame(ohlcv_list, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit='s', utc=True).dt.tz_convert(timezone)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    return df.drop_duplicates(subset=["timestamp"]).sort_values('timestamp').reset_index(drop=True)
 
-    df.attrs['reached_start'] is True when the API ran out of older data, i.e.
-    the frame starts at the pool's first minute. The features (minutes since
-    launch, launch / ATH features, the 12 h trading start) need exactly that.
+
+def _fetch_batch_before(pool_address, before_timestamp, bot_id, label, limit=1000, max_retries=5):
+    """
+    One backward page: up to `limit` 1-minute candles before `before_timestamp` (None = now).
+    Retries rate limits and errors; returns the ohlcv_list ([] = no older data) or None if
+    every attempt failed.
+    """
+    params = {
+        "aggregate": "1",
+        "limit": int(limit),
+        "currency": "token",
+        "token": "base",
+        "include_empty_intervals": "true"
+    }
+    if before_timestamp is not None:
+        params["before_timestamp"] = int(before_timestamp)
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(
+                f"{BASE_URL}/networks/{NETWORK}/pools/{pool_address}/ohlcv/minute",
+                params=params, timeout=15
+            )
+            if response.status_code == 429:
+                wait_time = 30 * (attempt + 1)
+                log_message(f"Rate limited on {label}, waiting {wait_time}s "
+                            f"(attempt {attempt + 1}/{max_retries})", bot_id, 'WARNING')
+                time.sleep(wait_time)
+                continue
+            response.raise_for_status()
+            return response.json()["data"]["attributes"]["ohlcv_list"]
+        except Exception as e:
+            wait_time = 10 * (attempt + 1)
+            log_message(f"Error fetching {label} (attempt {attempt + 1}/{max_retries}): "
+                        f"{type(e).__name__}: {e} — retrying in {wait_time}s", bot_id, 'WARNING')
+            time.sleep(wait_time)
+    return None
+
+
+def fetch_historical_ohlcv(pool_address, timezone, bot_id, batch_delay=15):
+    """
+    Fetch ALL available 1-minute OHLCV history, paging backwards from now until the API
+    has nothing older (the coin's first candle). The V9 features are anchored to the coin's
+    first candle, so a partial history is treated as a failure: returns the sorted DataFrame,
+    or None if a page could not be fetched.
     """
     all_data = []
-    current_before_timestamp = None
+    before_ts = None
+    low_count_streak = 0
+    batch_num = 0
 
-    log_message(f"Fetching historical data ({num_batches} batches)...", bot_id, 'INFO')
+    log_message("Fetching the full available history...", bot_id, 'INFO')
+    while True:
+        batch_num += 1
+        ohlcv_list = _fetch_batch_before(pool_address, before_ts, bot_id, f"history batch {batch_num}")
+        if ohlcv_list is None:
+            log_message(f"History batch {batch_num} failed — the full history could not be fetched",
+                        bot_id, 'ERROR')
+            return None
+        if not ohlcv_list:
+            log_message(f"Batch {batch_num}: no older data — reached the first candle", bot_id, 'INFO')
+            break
 
-    done = False
-    for i in range(num_batches):
-        params = {
-            "aggregate": "1",
-            "limit": 1000,
-            "currency": "token",
-            "token": "base",
-            "include_empty_intervals": "true"
-        }
-        if current_before_timestamp:
-            params["before_timestamp"] = current_before_timestamp
+        oldest = min(row[0] for row in ohlcv_list)
+        if before_ts is not None and oldest >= before_ts:
+            log_message(f"Batch {batch_num}: no older candles returned — stopping", bot_id, 'INFO')
+            break
+        all_data.extend(ohlcv_list)
+        before_ts = oldest
+        log_message(f"Batch {batch_num}: {len(ohlcv_list)} candles (total {len(all_data)})", bot_id, 'INFO')
 
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = requests.get(
-                    f"{BASE_URL}/networks/{NETWORK}/pools/{pool_address}/ohlcv/minute",
-                    params=params, timeout=10
-                )
-
-                if response.status_code == 429:
-                    wait_time = 30 * (attempt + 1)
-                    log_message(f"Rate limited on batch {i+1}, waiting {wait_time}s (attempt {attempt+1}/{max_retries})", bot_id, 'WARNING')
-                    time.sleep(wait_time)
-                    continue
-
-                response.raise_for_status()
-                ohlcv_list = response.json()["data"]["attributes"]["ohlcv_list"]
-
-                if not ohlcv_list:
-                    log_message(f"Batch {i+1}: No more data available", bot_id, 'INFO')
-                    done = True
-                    break
-
-                all_data.extend(ohlcv_list)
-                current_before_timestamp = ohlcv_list[-1][0]
-                log_message(f"Batch {i+1}: Retrieved {len(ohlcv_list)} candles", bot_id, 'INFO')
-
-                # A short batch (fewer than the page limit) means the API
-                # returned everything that exists earlier than our cursor.
-                # No need to make another request that would come back
-                # empty — flag done and skip the inter-batch sleep so the
-                # outer loop exits immediately on its next iteration.
-                if len(ohlcv_list) < 1000:
-                    log_message(
-                        f"Batch {i+1}: Short batch ({len(ohlcv_list)} < 1000) — "
-                        f"reached start of available data, no further fetches needed",
-                        bot_id, 'INFO'
-                    )
-                    done = True
-                    break
-
-                # Sleep between batches to respect rate limits — but not after
-                # the final allowed batch, since no further fetch will follow it.
-                if i < num_batches - 1:
-                    time.sleep(15)
-                break
-
-            # Note: a 429 is already caught by the status_code check above (which
-            # sleeps and continues before raise_for_status runs), so HTTPError
-            # here is only ever a non-429 error. Handled by the generic Exception
-            # block below — no separate HTTPError branch needed.
-            except Exception as e:
-                log_message(f"Error fetching batch {i+1}: {e}", bot_id, 'ERROR')
+        # The collection pipeline's stop rule: three nearly empty pages in a row = the start.
+        if len(ohlcv_list) <= 5:
+            low_count_streak += 1
+            if low_count_streak >= 3:
+                log_message("Stopping: 3 consecutive batches with <= 5 candles", bot_id, 'INFO')
                 break
         else:
-            log_message(f"Batch {i+1}: Failed after {max_retries} retries", bot_id, 'ERROR')
-            break
-        
-        if done:
-            break
+            low_count_streak = 0
+        time.sleep(batch_delay)
 
     if not all_data:
         return None
-
-    df = pd.DataFrame(all_data, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit='s', utc=True).dt.tz_convert(timezone)
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
-    # Consecutive pages can overlap at their boundary candle.
-    df = (df.drop_duplicates('timestamp', keep='last')
-            .sort_values('timestamp').reset_index(drop=True))
-    df.attrs['reached_start'] = bool(done)
-
-    return df
+    return _ohlcv_list_to_df(all_data, timezone)
 
 
-def fetch_ohlcv_since(pool_address, since_unix, timezone, bot_id, max_batches=60):
+def fetch_ohlcv_since(pool_address, since_ts, timezone, bot_id, batch_delay=15):
     """
-    Fetch every 1-minute candle from `since_unix` (inclusive) up to now, paging
-    backwards with before_timestamp (one call returns at most 1000 candles, so a
-    single call cannot fill a gap longer than ~16 h). Used to fill the gap after
-    a restart. Returns a sorted, de-duplicated DataFrame or None.
+    Fetch every candle newer than `since_ts` (a tz-aware timestamp), paging backwards from now
+    until the pages reach back to it. Used to close the gap after a restart, however long the
+    bot was down. Returns a DataFrame (possibly empty) or None if a page failed.
     """
-    pages = []
-    before = None
-    for i in range(max_batches):
-        params = {"aggregate": "1", "limit": 1000, "currency": "token", "token": "base",
-                  "include_empty_intervals": "true"}
-        if before:
-            params["before_timestamp"] = before
-        ohlcv_list = None
-        for attempt in range(3):
-            try:
-                resp = requests.get(f"{BASE_URL}/networks/{NETWORK}/pools/{pool_address}/ohlcv/minute",
-                                    params=params, timeout=10)
-                if resp.status_code == 429:
-                    wait = 30 * (attempt + 1)
-                    log_message(f"Rate limited while filling the gap, waiting {wait}s", bot_id, 'WARNING')
-                    time.sleep(wait)
-                    continue
-                resp.raise_for_status()
-                ohlcv_list = resp.json()["data"]["attributes"]["ohlcv_list"]
-                break
-            except Exception as e:
-                log_message(f"Gap fetch error (page {i + 1}): {type(e).__name__}: {e}", bot_id, 'WARNING')
-                time.sleep(2)
+    since_unix = int(pd.Timestamp(since_ts).timestamp())
+    all_data = []
+    before_ts = None
+    batch_num = 0
+    while True:
+        batch_num += 1
+        ohlcv_list = _fetch_batch_before(pool_address, before_ts, bot_id, f"gap batch {batch_num}")
+        if ohlcv_list is None:
+            return None
         if not ohlcv_list:
             break
-        pages.extend(ohlcv_list)
-        oldest = min(c[0] for c in ohlcv_list)
-        if oldest <= since_unix or len(ohlcv_list) < 1000:
+        oldest = min(row[0] for row in ohlcv_list)
+        if before_ts is not None and oldest >= before_ts:
             break
-        before = oldest
-        time.sleep(3)
-    else:
-        log_message(f"Gap fetch stopped after {max_batches} pages; the gap may be incomplete",
-                    bot_id, 'WARNING')
-    if not pages:
-        return None
-    df = pd.DataFrame(pages, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df = df[df["timestamp"] >= since_unix]
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit='s', utc=True).dt.tz_convert(timezone)
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
-    return (df.drop_duplicates('timestamp', keep='last')
-              .sort_values('timestamp').reset_index(drop=True))
+        all_data.extend(ohlcv_list)
+        before_ts = oldest
+        if oldest <= since_unix:
+            break
+        time.sleep(batch_delay)
+
+    if not all_data:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = _ohlcv_list_to_df(all_data, timezone)
+    return df[df["timestamp"] > pd.Timestamp(since_ts)].reset_index(drop=True)
 
 
 def fetch_ohlcv_from_timestamp(pool_address, after_timestamp, timezone, bot_id, debug=False):
@@ -278,43 +252,43 @@ def resolve_token_mint_and_decimals(pool_address, bot_id):
     return None, None
 
 
-def forward_fill_missing_minutes(df, timezone, bot_id, log=True, anchor_first_row=False):
+def backfill_missing_candles(df, prev_last_ts=None, prev_real_close=None):
     """
-    Put the candles on a gap-free 1-minute grid with the research fill rule, the
-    same as meme_coin_pipeline.ipynb and data_cleaning.ipynb (FINDINGS.md §0.5):
-    EVERY zero-volume minute, whether the API skipped it or returned it as an
-    empty interval, is a flat candle at the last REAL close (open = high = low =
-    close), volume 0. The features rely on one row per minute (row index ==
-    minutes since the first minute) and on exactly these flat candles.
+    The notebooks' gap fill (meme_coin_pipeline / data_cleaning backfill_missing_candles):
+    put the series on a continuous 1-minute grid and make EVERY zero-volume minute a FLAT
+    candle at the last real close: open = high = low = close, volume 0. That covers minutes
+    the API skipped and the API's own empty intervals. Adds 'backfilled' (1 = zero-volume
+    minute, 0 = real candle), derived from the volume.
 
-    anchor_first_row: the first row is the last minute already stored, which is
-    already on this rule, so its close is the last real close for the
-    zero-volume minutes that follow it. Used when new minutes are appended to
-    the history (bot_loop._append_minutes).
+    Without the optional arguments this is the notebook function on a whole series. To
+    extend an existing (already filled) series with newer candles, pass its last timestamp
+    as prev_last_ts and its last real close as prev_real_close: the grid then starts one
+    minute after prev_last_ts and zero-volume minutes before the first real candle in `df`
+    take prev_real_close — the same result as filling the whole joined series at once.
     """
-    if len(df) == 0:
+    if df is None or len(df) == 0:
         return df
-    df = df.drop_duplicates('timestamp', keep='last').sort_values('timestamp').reset_index(drop=True)
 
-    if log:
-        log_message("Forward filling missing minutes...", bot_id, 'INFO')
+    df = df.drop(columns=["backfilled"], errors="ignore")
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    if prev_last_ts is not None:
+        df = df[df["timestamp"] > prev_last_ts].reset_index(drop=True)
+        if len(df) == 0:
+            return df.assign(backfilled=pd.Series(dtype=int))
+        start = pd.Timestamp(prev_last_ts) + pd.Timedelta(minutes=1)
+    else:
+        start = df["timestamp"].min()
 
-    complete_range = pd.date_range(start=df['timestamp'].min(), end=df['timestamp'].max(),
-                                   freq='1min', tz=timezone)
-    merged_df = pd.DataFrame({'timestamp': complete_range}).merge(df, on='timestamp', how='left')
-
-    merged_df['volume'] = merged_df['volume'].fillna(0.0)
-    zero = (merged_df['volume'] <= 0).to_numpy()
-    real_close = merged_df['close'].where(~zero)              # closes of real candles only
-    if anchor_first_row:
-        real_close.iloc[0] = merged_df['close'].iloc[0]
-    last_close = real_close.ffill()                           # the last REAL close
-    last_close = last_close.fillna(merged_df['close'].bfill())  # zero-volume minutes before any real candle
-    for col in ('open', 'high', 'low', 'close'):
-        merged_df.loc[zero, col] = last_close[zero]
-
-    filled_count = len(merged_df) - len(df)
-    if log or filled_count:
-        log_message(f"Filled {filled_count} missing minutes", bot_id, 'INFO')
-
-    return merged_df.reset_index(drop=True)
+    full_range = pd.date_range(start=start, end=df["timestamp"].max(), freq="1min")
+    df_filled = df.set_index("timestamp").reindex(full_range)
+    df_filled["volume"] = df_filled["volume"].fillna(0)
+    zero = (df_filled["volume"] <= 0).to_numpy()
+    last_close = df_filled["close"].where(~zero).ffill()          # last REAL close
+    if prev_real_close is not None:
+        last_close = last_close.fillna(float(prev_real_close))
+    last_close = last_close.fillna(df_filled["close"].bfill())    # zero-volume minutes before any real candle
+    for col in ("open", "high", "low", "close"):
+        df_filled.loc[zero, col] = last_close[zero]
+    df_filled["backfilled"] = zero.astype(int)
+    df_filled = df_filled.reset_index().rename(columns={"index": "timestamp"})
+    return df_filled

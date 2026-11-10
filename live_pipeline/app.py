@@ -8,7 +8,7 @@ All monetary values returned by the API are in SOL.
 The frontend handles USD conversion using the current SOL price.
 """
 
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, Response, stream_with_context
 import psutil
 import os
 import re
@@ -16,14 +16,14 @@ from datetime import timedelta
 import threading
 import time
 import requests
+import json
 from database import (
     init_database, get_recent_logs, get_global_settings,
     get_bot_trades, get_all_trades, log_message,
     get_latest_sol_price, insert_sol_price, get_latest_ohlcv,
     get_bot, get_wallet_status, initialize_wallet,
     get_bot_stats_precomputed,
-    get_last_modified_timestamps,
-    get_strategy_config, update_strategy_config,
+    get_last_modified_timestamps, get_change_markers,
     get_capital_history_page, get_capital_history_after,
     insert_wallet_capital_snapshot, get_wallet_capital_page, get_wallet_capital_after,
     update_bot_config
@@ -36,6 +36,9 @@ init_database()
 
 from bot_manager import bot_manager
 from datetime import datetime
+from strategy import TUNED_PARAMS, FIXED_PARAMS, STRATEGY, use_strategy, strategy_files, read_strategy
+from scoring import verify_models
+from features import START_IDX, PUMP_SETS, LIQ_STATS_REFRESH_MIN
 
 # Track last wallet snapshot minute to avoid duplicates
 _last_wallet_snapshot_minute = None
@@ -118,6 +121,37 @@ def get_system_stats():
 @app.route('/')
 def index():
     return render_template('dashboard.html')
+
+@app.route('/api/stream')
+def api_stream():
+    """
+    Live update stream (Server-Sent Events). Checks the database's change
+    markers once a second and sends a 'markers' event whenever any of them
+    changed; the dashboard then refetches only the parts that changed. A
+    comment line every 15 s keeps the connection open through proxies.
+    """
+    def generate():
+        last = None
+        idle = 0
+        yield 'retry: 3000\n\n'
+        while True:
+            try:
+                markers = get_change_markers()
+            except Exception as e:
+                markers = {'error': str(e)}
+            if markers != last:
+                last = markers
+                idle = 0
+                yield f"event: markers\ndata: {json.dumps(markers, default=str)}\n\n"
+            else:
+                idle += 1
+                if idle >= 15:
+                    idle = 0
+                    yield ': keep-alive\n\n'
+            time.sleep(1)
+
+    return Response(stream_with_context(generate()), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
 @app.route('/api/system')
 def api_system():
@@ -420,17 +454,30 @@ def initialize_bot():
         allocation_value = data.get('allocation_value')
         image_thumb_base64 = data.get('image_thumb')
         image_small_base64 = data.get('image_small')
-        confidence_threshold = data.get('confidence_threshold', 0.907)
         max_price_impact_pct = data.get('max_price_impact_pct', 0.00333)
+        strategy_name = data.get('strategy_name')
 
         if not all([bot_id, coin_symbol, pool, allocation_type, allocation_value]):
             return jsonify({'success': False, 'error': 'Missing required parameters'}), 400
+
+        # the strategy must be a usable strategy file in the model folder (default: the first one)
+        listing = list_strategies()
+        usable = {s['name'] for s in listing['strategies'] if s['valid']}
+        if not strategy_name:
+            strategy_name = listing['default']
+        if not strategy_name:
+            return jsonify({'success': False, 'error': f"No usable strategy in {listing['model_dir']}/: "
+                                                       f"copy strategy.ipynb's live_artifacts/ files there"}), 400
+        if strategy_name not in usable:
+            bad = next((s for s in listing['strategies'] if s['name'] == strategy_name), None)
+            return jsonify({'success': False, 'error': f"Strategy '{strategy_name}' can't be used: "
+                                                       f"{bad['error'] if bad else 'not in the model folder'}"}), 400
 
         result = bot_manager.initialize_bot(
             bot_id, coin_symbol, pool,
             allocation_type, allocation_value,
             image_thumb_base64, image_small_base64,
-            confidence_threshold, max_price_impact_pct
+            max_price_impact_pct, strategy_name
         )
         return jsonify(result)
     except Exception as e:
@@ -538,6 +585,28 @@ def deallocate_bot():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+@app.route('/api/bots/pause-all', methods=['POST'])
+def pause_all_bots():
+    """Pause every running bot (paused and stopped bots stay as they are)."""
+    try:
+        results = bot_manager.pause_all_bots()
+        failed = [r for r in results if not r['result'].get('success')]
+        return jsonify({'success': not failed, 'count': len(results) - len(failed), 'results': results,
+                        'error': '; '.join(f"Bot {r['bot_id']}: {r['result'].get('error')}" for r in failed) or None})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/bots/resume-all', methods=['POST'])
+def resume_all_bots():
+    """Start every paused or stopped bot (running bots stay as they are)."""
+    try:
+        results = bot_manager.resume_all_bots()
+        failed = [r for r in results if not r['result'].get('success')]
+        return jsonify({'success': not failed, 'count': len(results) - len(failed), 'results': results,
+                        'error': '; '.join(f"Bot {r['bot_id']}: {r['result'].get('error')}" for r in failed) or None})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/bot/stop-all', methods=['POST'])
 def stop_all_bots():
     try:
@@ -590,52 +659,104 @@ def fetch_token_info():
 # CONFIGURATION ENDPOINTS
 # ========================================================================
 
+def model_dir_setting():
+    return (get_global_settings() or {}).get('model_dir') or 'artifacts'
+
+
+def list_strategies():
+    """The strategy files in the model folder, in file-name order, each checked against the
+    models there. The default is the first usable one."""
+    model_dir = model_dir_setting()
+    out = []
+    for name, path in strategy_files(model_dir).items():
+        entry = {'name': name}
+        try:
+            doc = read_strategy(path)
+            verify_models(model_dir, doc)
+            sel = doc.get('selection', {})
+            entry.update(valid=True, combo_cutoff=doc['combo_cutoff'], created_utc=doc.get('created_utc'),
+                         selected_by=sel.get('selected_by'), run=sel.get('run'), n_runs=sel.get('n_runs'),
+                         test_score=sel.get('test_score'), val_score=sel.get('val_score'))
+        except Exception as e:
+            entry.update(valid=False, error=str(e))
+        out.append(entry)
+    default = next((s['name'] for s in out if s['valid']), None)
+    return {'model_dir': model_dir, 'strategies': out, 'default': default}
+
+
+def ensure_strategy():
+    """Load the default strategy (the first usable strategy file in the model folder) into
+    strategy.py, for the parts of the dashboard that show one strategy. Loaded once; retried
+    while it fails, so copying the artifacts in later works without a restart. Returns None
+    or the error."""
+    if STRATEGY:
+        return None
+    try:
+        model_dir = model_dir_setting()
+        default = list_strategies()['default']
+        if default is None:
+            raise ValueError(f"no usable strategy_<name>.json in {model_dir}/")
+        doc = use_strategy(model_dir, default)
+        verify_models(model_dir, doc)
+        return None
+    except Exception as e:
+        STRATEGY.clear()
+        TUNED_PARAMS.clear()
+        return str(e)
+
+
+def strategy_summary():
+    sel = STRATEGY.get('selection', {})
+    return {'name': STRATEGY.get('name'), 'created_utc': STRATEGY.get('created_utc'),
+            'selected_by': sel.get('selected_by'), 'run': sel.get('run'), 'n_runs': sel.get('n_runs'),
+            'val_score': sel.get('val_score'), 'test_score': sel.get('test_score')}
+
+
+_startup_strategy_error = ensure_strategy()
+print(f"Strategy: {_startup_strategy_error}" if _startup_strategy_error else
+      f"Strategy '{STRATEGY.get('name')}' loaded (combo cutoff {TUNED_PARAMS.get('combo_cutoff')})")
+
+
+@app.route('/api/strategies')
+def api_strategies():
+    """The strategies in the model folder for the bot setup dropdown (default: the first usable one)."""
+    try:
+        return jsonify(list_strategies())
+    except Exception as e:
+        return jsonify({'error': str(e), 'strategies': [], 'default': None}), 500
+
+
 @app.route('/api/hardcoded-params')
 def api_hardcoded_params():
-    """The fixed pipeline settings and the strategy parameters, for display."""
-    strategy = get_strategy_config()
-    settings = get_global_settings() or {}
+    """The feature/model settings and the loaded strategy, for display."""
+    err = ensure_strategy()
     return jsonify({
-        'pipeline': {
-            'features': 'features.py (the Dataset_creationV9 feature code, 169 features)',
-            'models': 'move (+10% within 30 min) x direction (A50: +15% before -15% within 2 h)',
-            'scores': 'percentiles within the saved tune reference distributions',
-            'model_dir': settings.get('model_dir'),
-            'params_path': settings.get('params_path'),
-            'feature_start_minutes': 120,
-            'trading_start_minutes': (strategy or {}).get('trading_start_minutes', 720),
+        'training_params': {
+            'feature_set': 'Dataset_creationV9',
+            'first_feature_row': START_IDX,
+            'pump_sets': PUMP_SETS,
+            'liquidity_refresh_minutes': LIQ_STATS_REFRESH_MIN,
+            'move_label': '+10% within 30 min',
+            'direction_label': '+15% before -15% within 2 h',
         },
-        'strategy_params': strategy,
-        'note': 'Strategy params come from best_params.json (reloaded when the file changes); '
-                'edits via /api/config/strategy last until then.'
+        'strategy': None if err else strategy_summary(),
+        'strategy_params': None if err else dict(TUNED_PARAMS, **FIXED_PARAMS),
+        'strategy_error': err,
+        'note': 'Feature settings are fixed in features.py; the strategy comes from the strategy file '
+                'in the model folder.'
     })
 
 @app.route('/api/config/strategy', methods=['GET', 'POST'])
 def api_strategy_config():
-    """Get or update the strategy configuration (validated; tier keys rejected)."""
-    try:
-        if request.method == 'POST':
-            data = request.json
-            if not data:
-                return jsonify({'success': False, 'error': 'No data provided'}), 400
-            from strategy import build_strategy_config
-            current = get_strategy_config() or {}
-            merged = dict(current)
-            merged.update(data)
-            try:
-                validated = build_strategy_config(merged)
-            except ValueError as e:
-                return jsonify({'success': False, 'error': str(e)}), 400
-            validated['params_sha'] = current.get('params_sha')
-            update_strategy_config(validated)
-            log_message(f'Strategy config updated: {list(data.keys())} (deviates from the tuned run; '
-                        f'restart bots to apply)', None, 'WARNING')
-            return jsonify({'success': True, 'config': get_strategy_config()})
-        else:
-            config = get_strategy_config()
-            return jsonify(config if config else {})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    """The loaded strategy's parameters (from the strategy file; read-only)."""
+    if request.method == 'POST':
+        return jsonify({'success': False,
+                        'error': 'Strategy parameters come from the strategy file in the model folder '
+                                 '(strategy.ipynb export); they cannot be edited here'}), 405
+    err = ensure_strategy()
+    if err:
+        return jsonify({'error': err}), 503
+    return jsonify(dict(TUNED_PARAMS, **FIXED_PARAMS, strategy_name=STRATEGY.get('name')))
 
 # ========================================================================
 # EXISTING DATA ENDPOINTS
@@ -705,4 +826,4 @@ if __name__ == '__main__':
     print(f"SOL price collector: Running (updates every 15 minutes)")
     print("=" * 70)
 
-    app.run(host='0.0.0.0', port=8050, debug=True, use_reloader=False)
+    app.run(host='0.0.0.0', port=8050, debug=True, use_reloader=False, threaded=True)

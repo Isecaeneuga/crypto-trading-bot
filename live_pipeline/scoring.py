@@ -1,56 +1,36 @@
 """
-scoring.py — the two models -> the strategy's three percentile scores, exactly
-as in the research sims (development_notebooks/strategy.ipynb, cell "MODELS + DATA").
+scoring.py — the two models -> the scores the strategy and the dashboard use.
 
-  combo_pct = percentile of P_move * P_dir   (buy gate: combo_pct >= confidence_threshold)
-  dir_pct   = percentile of P_dir            (signal exit, off by default; dashboard)
-  move_pct  = percentile of P_move           (signal exit, off by default; dashboard)
+  combo     = P_move x P_dir   (buy gate: combo >= combo_cutoff)
+  raw_dir   = P_dir            (dashboard)
+  raw_move  = P_move           (dashboard)
 
-Percentiles are taken within the TUNE-split predictions saved with the models
-(ref_*.npy), never within live data, so a threshold means the same thing in
-the research and live.
+The research thresholds are percentiles within the tune-split predictions
+(strategy.ipynb). The live bot does not need those predictions: a percentile
+only grows with the raw value, so "combo percentile >= confidence_threshold"
+is exactly "combo >= combo_cutoff", where combo_cutoff is the tune combo at that
+rank. strategy.ipynb computes combo_cutoff once; it is hard-coded in strategy.py.
 
-Files in model_dir (default artifacts/, written by the export cell of strategy.ipynb):
-  move.ubj, direction.ubj                          the two XGBoost models; each file
-                                                   carries its feature list and order
-  ref_move.npy, ref_direction.npy, ref_combo.npy   the tune predictions (P_move,
-                                                   P_dir, P_move * P_dir)
+Files in model_dir (default artifacts/, copied from the live_artifacts/ folder of strategy.ipynb):
+  move.ubj, direction.ubj    the two XGBoost models; each file carries its feature list and order
+  strategy_<name>.json       the strategy tuned on them (strategy.py), with their fingerprints
 """
+import hashlib
 from pathlib import Path
 
 import numpy as np
 import xgboost as xgb
 
 
-def to_percentile(values, reference):
-    """Share of reference values <= x, clipped to [1e-6, 1] (identical to the research code)."""
-    return _percentile_sorted(values, np.sort(np.asarray(reference, dtype=np.float64)))
-
-
-def _percentile_sorted(values, sorted_ref):
-    """to_percentile for a reference that is already sorted (no re-sort every minute)."""
-    pct = np.searchsorted(sorted_ref, np.asarray(values, dtype=np.float64), side='right') / len(sorted_ref)
-    return np.clip(pct, 1e-6, 1.0)
-
-
 def _load_model(path):
     if not path.exists():
-        raise FileNotFoundError(f"{path} not found (run the export cell of strategy.ipynb "
-                                f"and copy its files into the model folder)")
+        raise FileNotFoundError(f"{path} not found (copy the models written by the export cell "
+                                f"of strategy.ipynb into the model folder)")
     m = xgb.Booster()
     m.load_model(str(path))
     if not m.feature_names:
         raise ValueError(f"{path} has no feature names; the research models always carry them")
     return m
-
-
-def _load_reference(path):
-    if not path.exists():
-        raise FileNotFoundError(f"{path} not found (run the export cell of strategy.ipynb)")
-    ref = np.sort(np.load(path).astype(np.float64))
-    if ref.size == 0 or not np.isfinite(ref).all():
-        raise ValueError(f"{path} is empty or contains non-finite values")
-    return ref
 
 
 def _iteration_range(model):
@@ -59,6 +39,27 @@ def _iteration_range(model):
         return (0, int(model.best_iteration) + 1)
     except (AttributeError, TypeError, ValueError):
         return (0, 0)
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def verify_models(model_dir, strategy):
+    """The strategy's combo_cutoff is a score of the models it was tuned on: raise unless
+    move.ubj and direction.ubj are exactly those models (by sha256)."""
+    d = Path(model_dir)
+    for key, fname in (('move', 'move.ubj'), ('direction', 'direction.ubj')):
+        want = strategy['models'][key]['sha256']
+        have = file_sha256(d / fname)
+        if have != want:
+            raise ValueError(f"{d / fname} is not the {key} model strategy '{strategy.get('name')}' was tuned on "
+                             f"(sha256 {have[:12]}..., expected {want[:12]}...); copy the strategy file together "
+                             f"with its models from strategy.ipynb's live_artifacts/")
 
 
 class LiveScorer:
@@ -70,9 +71,6 @@ class LiveScorer:
         self.dir_features = list(self.dir.feature_names)
         self._move_range = _iteration_range(self.move)
         self._dir_range = _iteration_range(self.dir)
-        self.ref_move = _load_reference(d / "ref_move.npy")
-        self.ref_dir = _load_reference(d / "ref_direction.npy")
-        self.ref_combo = _load_reference(d / "ref_combo.npy")
 
     @staticmethod
     def _predict(model, feats, iteration_range, df):
@@ -85,7 +83,7 @@ class LiveScorer:
         """feature_df: rows from features.compute_live_features. Returns a dict of numpy arrays."""
         pm = self._predict(self.move, self.move_features, self._move_range, feature_df)
         pdir = self._predict(self.dir, self.dir_features, self._dir_range, feature_df)
-        return {'raw_move': pm, 'raw_dir': pdir,
-                'combo_pct': _percentile_sorted(pm * pdir, self.ref_combo),
-                'dir_pct': _percentile_sorted(pdir, self.ref_dir),
-                'move_pct': _percentile_sorted(pm, self.ref_move)}
+        # The product in the models' own precision (float32), exactly as the
+        # research computes it before ranking; compared in float64.
+        combo = (pm * pdir).astype(np.float64)
+        return {'raw_move': pm.astype(np.float64), 'raw_dir': pdir.astype(np.float64), 'combo': combo}

@@ -1,7 +1,5 @@
 import sqlite3
 import os
-import json
-import hashlib
 import time
 import math
 import functools
@@ -10,19 +8,6 @@ from contextlib import contextmanager
 
 # Path to the SQLite database file, stored in the data/ subdirectory
 DATABASE_PATH = "data/trading_bots.db"
-
-# The research artifacts: the two models, the tune reference distributions and
-# the tuned parameters, written by the export cell of strategy.ipynb.
-DEFAULT_MODEL_DIR = "artifacts"
-DEFAULT_PARAMS_PATH = "artifacts/best_params.json"
-
-
-def _ensure_column(cursor, table, column, decl):
-    """Add a column to an existing table if it is missing (schema migration
-    for databases created by an older version)."""
-    cursor.execute(f"PRAGMA table_info({table})")
-    if column not in {row[1] for row in cursor.fetchall()}:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def _sql_float(value):
@@ -99,12 +84,12 @@ def init_database():
     Tables created:
     - global_settings: Single-row table for system-wide config (wallet, timezone, etc.)
     - sol_price_history: Time series of SOL/USD prices for historical reference
-    - bot_config: Static bot configuration (coin_symbol, pool, thresholds, images)
+    - bot_config: Static bot configuration (coin_symbol, pool, price-impact cap, images)
     - bot_runtime: Process lifecycle state (status, PID, force-sell flags)
     - bot_trading_state: Trading position state (capital, shares, entry price)
-    - ohlcv_data: Per-bot OHLCV candle data with pre-computed features
+    - ohlcv_data: Per-bot OHLCV candles (filled as the data notebooks) + liquidity estimate
     - trades: Trade history with entry/exit prices and P&L (SOL-denominated)
-    - predictions: ML model predictions per bot per minute
+    - predictions: Model scores per bot per minute (combo, P_move, P_dir)
     - capital_history: Time series of capital composition snapshots
     - system_logs: Application-wide log messages
     """
@@ -122,9 +107,7 @@ def init_database():
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 timezone TEXT DEFAULT 'Europe/Amsterdam',
                 model_dir TEXT DEFAULT 'artifacts',
-                params_path TEXT DEFAULT 'artifacts/best_params.json',
                 finalization_lag_minutes INTEGER DEFAULT 1,
-                historical_days INTEGER DEFAULT 30,
                 wallet_sol REAL DEFAULT 0,
                 wallet_initialized INTEGER DEFAULT 0,
                 total_fees_sol REAL DEFAULT 0,
@@ -141,7 +124,7 @@ def init_database():
         cursor.execute("SELECT COUNT(*) as count FROM global_settings")
         if cursor.fetchone()['count'] == 0:
             cursor.execute('''
-                INSERT INTO global_settings (id, historical_days) VALUES (1, 30)
+                INSERT INTO global_settings (id) VALUES (1)
             ''')
 
         # ============================================
@@ -172,9 +155,9 @@ def init_database():
                 name TEXT NOT NULL,
                 pool_address TEXT,
                 coin_symbol TEXT,
-                confidence_threshold REAL DEFAULT 0.907,
                 slippage_pct REAL DEFAULT 0.015,
                 max_price_impact_pct REAL DEFAULT 0.00333,
+                strategy_name TEXT,
                 debug_mode INTEGER DEFAULT 0,
                 coin_image_thumb_base64 TEXT,
                 coin_image_small_base64 TEXT,
@@ -214,7 +197,7 @@ def init_database():
                 position TEXT DEFAULT 'closed',
                 trades_count INTEGER DEFAULT 0,
 
-                -- Trade state fields (display copies of strategy_state) --
+                -- Trade state fields --
                 original_entry_price REAL,
                 original_entry_timestamp TEXT,
                 n_reentries INTEGER DEFAULT 0,
@@ -226,9 +209,6 @@ def init_database():
                 trade_phase TEXT DEFAULT 'normal',
                 below_floor_count INTEGER DEFAULT 0,
                 max_price_seen REAL,
-                -- The full strategy state machine (strategy.StrategyState as JSON);
-                -- the source of truth, the columns above are copies for display.
-                strategy_state TEXT,
 
                 CHECK (
                     (position = 'closed' AND shares_held = 0 AND entry_price_sol IS NULL)
@@ -237,21 +217,6 @@ def init_database():
                 )
             )
         ''')
-
-        # ============================================
-        # STRATEGY_CONFIG TABLE
-        # ============================================
-
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS strategy_config (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                config_json TEXT NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-
-        # The strategy config is seeded from best_params.json further below
-        # (sync_strategy_config_from_file), after all tables exist.
 
         # ============================================
         # OHLCV_DATA TABLE
@@ -268,12 +233,8 @@ def init_database():
                 close REAL NOT NULL,
                 volume REAL NOT NULL,
                 bot_action TEXT,
-                returns REAL,
-                completed_pump INTEGER,
-                vol_120 REAL,
+                backfilled INTEGER,
                 estimated_sol_1pct_impact REAL,
-                liquidity_sample_age_minutes REAL,
-                liquidity_estimate_std_pct REAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(bot_id, timestamp),
                 FOREIGN KEY (bot_id) REFERENCES bot_config(id)
@@ -333,14 +294,12 @@ def init_database():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 bot_id INTEGER NOT NULL,
                 timestamp TIMESTAMP NOT NULL,
-                prediction REAL NOT NULL,          -- combo percentile (buy gate)
-                price REAL NOT NULL,
-                dir_pct REAL,                      -- direction percentile
-                move_pct REAL,                     -- move percentile
+                combo REAL NOT NULL,
                 raw_move REAL,
                 raw_dir REAL,
+                price REAL NOT NULL,
                 price_position_15m REAL,
-                price_position_60m REAL,           -- the feature price_position_1h
+                price_position_60m REAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (bot_id) REFERENCES bot_config(id)
             )
@@ -438,72 +397,6 @@ def init_database():
                     INSERT INTO bot_trading_state (bot_id, position, shares_held) VALUES (?, 'closed', 0)
                 ''', (i,))
 
-        # ============================================
-        # MIGRATIONS (databases created by the 5-tier version)
-        # ============================================
-        # Old tier columns (tier_model_path, entry_regime_tier, last_sell_tier,
-        # predictions.regime_tier) are left in place but no longer used.
-        _ensure_column(cursor, 'global_settings', 'model_dir', f"TEXT DEFAULT '{DEFAULT_MODEL_DIR}'")
-        _ensure_column(cursor, 'global_settings', 'params_path', f"TEXT DEFAULT '{DEFAULT_PARAMS_PATH}'")
-        # A stored path that no longer exists (e.g. from an older layout) falls
-        # back to the default when the default is in place.
-        cursor.execute("SELECT model_dir, params_path FROM global_settings WHERE id = 1")
-        _row = cursor.fetchone()
-        if _row:
-            if _row['model_dir'] != DEFAULT_MODEL_DIR and not os.path.isdir(_row['model_dir'] or '') \
-                    and os.path.isdir(DEFAULT_MODEL_DIR):
-                cursor.execute("UPDATE global_settings SET model_dir = ? WHERE id = 1", (DEFAULT_MODEL_DIR,))
-            if _row['params_path'] != DEFAULT_PARAMS_PATH and not os.path.exists(_row['params_path'] or '') \
-                    and os.path.exists(DEFAULT_PARAMS_PATH):
-                cursor.execute("UPDATE global_settings SET params_path = ? WHERE id = 1", (DEFAULT_PARAMS_PATH,))
-        _ensure_column(cursor, 'bot_trading_state', 'strategy_state', 'TEXT')
-        for col in ('dir_pct', 'move_pct', 'raw_move', 'raw_dir'):
-            _ensure_column(cursor, 'predictions', col, 'REAL')
-
-    sync_strategy_config_from_file()
-
-
-def _file_sha(path):
-    with open(path, 'rb') as f:
-        return hashlib.sha256(f.read()).hexdigest()[:16]
-
-
-def sync_strategy_config_from_file(force=False):
-    """
-    Make strategy_config the parameter set of best_params.json.
-
-    Replaced when: nothing is stored yet, the stored config is the old 5-tier
-    format, or best_params.json changed since it was loaded (its hash is stored
-    as params_sha). Edits made through /api/config/strategy survive restarts
-    until the file changes. The stored signal_exit_enabled switch is kept.
-    """
-    from strategy import load_best_params, is_legacy_config
-    settings = get_global_settings() or {}
-    path = settings.get('params_path') or DEFAULT_PARAMS_PATH
-    current = get_strategy_config()
-    if not os.path.exists(path):
-        if current is None or is_legacy_config(current):
-            log_message(f"Strategy parameters not found at {path}: bots cannot start until "
-                        f"best_params.json is in place", None, 'ERROR')
-        return current
-    sha = _file_sha(path)
-    if (not force and current and not is_legacy_config(current)
-            and current.get('params_sha') == sha):
-        return current
-    config = load_best_params(path)
-    config['params_sha'] = sha
-    if current and not is_legacy_config(current) and 'signal_exit_enabled' in current:
-        config['signal_exit_enabled'] = bool(current['signal_exit_enabled'])
-    with get_db_connection() as conn:
-        conn.execute('''
-            INSERT INTO strategy_config (id, config_json, updated_at) VALUES (1, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json,
-                                          updated_at = excluded.updated_at
-        ''', (json.dumps(config), datetime.now()))
-    log_message(f"Strategy config loaded from {path} (run {config.get('params_run')}, "
-                f"signal exit {'ON' if config.get('signal_exit_enabled') else 'off'})", None, 'INFO')
-    return config
-
 
 # ============================================
 # GLOBAL SETTINGS OPERATIONS
@@ -523,34 +416,6 @@ def get_global_settings():
 
 
 # ============================================
-# STRATEGY CONFIG OPERATIONS
-# ============================================
-
-def get_strategy_config():
-    """
-    Fetch the strategy config as a Python dict.
-    Returns the parsed JSON config, or None if not seeded.
-    """
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT config_json FROM strategy_config WHERE id = 1")
-        row = cursor.fetchone()
-        return json.loads(row['config_json']) if row else None
-
-def update_strategy_config(config_dict):
-    """
-    Replace the strategy config with a new dict.
-    Stores as JSON in the single-row strategy_config table.
-    """
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE strategy_config SET config_json = ?, updated_at = ? WHERE id = 1
-        ''', (json.dumps(config_dict), datetime.now()))
-    return get_strategy_config()
-
-
-# ============================================
 # BOT OPERATIONS
 # ============================================
 
@@ -565,8 +430,7 @@ _BOT_VIEW_SELECT = '''
            t.n_reentries,
            t.last_sell_close, t.last_sell_idx,
            t.latest_activation_pct,
-           t.trade_phase, t.below_floor_count, t.max_price_seen,
-           t.strategy_state
+           t.trade_phase, t.below_floor_count, t.max_price_seen
     FROM bot_config c
     JOIN bot_runtime r ON c.id = r.bot_id
     JOIN bot_trading_state t ON c.id = t.bot_id
@@ -590,9 +454,9 @@ def get_all_bots_from_db():
 
 # Columns that belong to each table, used for routing
 BOT_CONFIG_COLUMNS = {
-    'name', 'pool_address', 'confidence_threshold', 'slippage_pct',
+    'name', 'pool_address', 'slippage_pct',
     'max_price_impact_pct', 'coin_symbol', 'coin_image_thumb_base64',
-    'coin_image_small_base64', 'debug_mode', 'coin_assigned_at'
+    'coin_image_small_base64', 'debug_mode', 'coin_assigned_at', 'strategy_name'
 }
 
 BOT_RUNTIME_COLUMNS = {
@@ -607,7 +471,7 @@ BOT_TRADING_STATE_COLUMNS = {
     'n_reentries', 'last_sell_close', 'last_sell_idx',
     'latest_activation_pct',
     # State-machine fields
-    'trade_phase', 'below_floor_count', 'max_price_seen', 'strategy_state',
+    'trade_phase', 'below_floor_count', 'max_price_seen',
 }
 
 def _update_bot_table(table, where_col, bot_id, allowed_columns,
@@ -654,7 +518,7 @@ def update_bot_trading_state(bot_id, **kwargs):
 
 def initialize_bot_in_db(bot_id, pool_address, coin_symbol, initial_capital_sol,
                         image_thumb_base64=None, image_small_base64=None,
-                        confidence_threshold=0.907, max_price_impact_pct=0.00333):
+                        max_price_impact_pct=0.00333, strategy_name=None):
     """Initialize a bot across all three tables."""
 
     # Clear old data (run once, not part of the retried section below)
@@ -668,14 +532,14 @@ def initialize_bot_in_db(bot_id, pool_address, coin_symbol, initial_capital_sol,
     return _write_initial_bot_state(
         bot_id, pool_address, coin_symbol, initial_capital_sol,
         image_thumb_base64, image_small_base64,
-        confidence_threshold, max_price_impact_pct
+        max_price_impact_pct, strategy_name
     )
 
 
 @retry_on_locked()
 def _write_initial_bot_state(bot_id, pool_address, coin_symbol, initial_capital_sol,
                              image_thumb_base64, image_small_base64,
-                             confidence_threshold, max_price_impact_pct):
+                             max_price_impact_pct, strategy_name=None):
     """Write the fresh config/runtime/trading-state rows for a bot. Retried on lock."""
     update_bot_config(
         bot_id,
@@ -683,8 +547,8 @@ def _write_initial_bot_state(bot_id, pool_address, coin_symbol, initial_capital_
         coin_symbol=coin_symbol,
         coin_image_thumb_base64=image_thumb_base64,
         coin_image_small_base64=image_small_base64,
-        confidence_threshold=confidence_threshold,
         max_price_impact_pct=max_price_impact_pct,
+        strategy_name=strategy_name,
         # Start the assigned-to-coin clock. This is the only place it is set;
         # it is untouched by start/pause/resume and cleared only on deallocate.
         coin_assigned_at=datetime.now()
@@ -708,8 +572,7 @@ def _write_initial_bot_state(bot_id, pool_address, coin_symbol, initial_capital_
         # State-machine reset
         trade_phase='normal',
         below_floor_count=0,
-        max_price_seen=None,
-        strategy_state=None
+        max_price_seen=None
     )
 
     # Record initial capital snapshots (2 rows for visible chart area)
@@ -729,8 +592,8 @@ def _write_initial_bot_state(bot_id, pool_address, coin_symbol, initial_capital_
 
 def insert_ohlcv_data(bot_id, ohlcv_list):
     """
-    Bulk insert OHLCV candle data for a bot, including pre-computed
-    feature columns. Uses INSERT OR REPLACE so duplicate timestamps
+    Bulk insert OHLCV candle data for a bot, with the backfilled flag and the
+    liquidity estimate. Uses INSERT OR REPLACE so duplicate timestamps
     (same bot_id + timestamp) get overwritten.
 
     Uses _sql_float() to convert NaN values to SQL NULL, since SQLite
@@ -741,11 +604,10 @@ def insert_ohlcv_data(bot_id, ohlcv_list):
 
         for row in ohlcv_list:
             cursor.execute('''
-                INSERT OR REPLACE INTO ohlcv_data 
+                INSERT OR REPLACE INTO ohlcv_data
                 (bot_id, timestamp, open, high, low, close, volume, bot_action,
-                 returns, completed_pump, vol_120, 
-                 estimated_sol_1pct_impact, liquidity_sample_age_minutes, liquidity_estimate_std_pct)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 backfilled, estimated_sol_1pct_impact)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 bot_id,
                 str(row['timestamp']),
@@ -755,12 +617,8 @@ def insert_ohlcv_data(bot_id, ohlcv_list):
                 float(row['close']),
                 float(row['volume']),
                 row.get('bot_action'),
-                _sql_float(row.get('returns')),
-                int(row['completed_pump']) if row.get('completed_pump') is not None else None,
-                _sql_float(row.get('vol_120')),
-                _sql_float(row.get('estimated_sol_1pct_impact')),
-                _sql_float(row.get('liquidity_sample_age_minutes')),
-                _sql_float(row.get('liquidity_estimate_std_pct'))
+                int(row['backfilled']) if row.get('backfilled') is not None else None,
+                _sql_float(row.get('estimated_sol_1pct_impact'))
             ))
 
 def get_latest_ohlcv(bot_id, limit=200):
@@ -784,18 +642,17 @@ def get_latest_ohlcv(bot_id, limit=200):
 
 def get_all_ohlcv(bot_id):
     """
-    Every stored candle of a bot (the coin's full history, which the features
-    need), oldest first. Callers sort again by parsed time: ordering by the
-    timestamp TEXT can misplace rows around a DST change.
+    Every stored OHLCV candle of a bot, oldest first. The bot's features need the
+    coin's full history from its first candle, so the resume path loads all of it.
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT timestamp, open, high, low, close, volume, bot_action
-            FROM ohlcv_data WHERE bot_id = ? ORDER BY timestamp ASC
-        ''', (bot_id,))
+        cursor.execute("""
+            SELECT * FROM ohlcv_data
+            WHERE bot_id = ?
+            ORDER BY timestamp ASC
+        """, (bot_id,))
         return [dict(row) for row in cursor.fetchall()]
-
 
 def get_latest_timestamp(bot_id):
     """
@@ -913,24 +770,23 @@ def get_all_trades(limit=50):
 # PREDICTION OPERATIONS
 # ============================================
 
-def insert_predictions(bot_id, rows):
+def insert_prediction(bot_id, timestamp, combo, raw_move, raw_dir, price,
+                      price_position_15m=None, price_position_60m=None):
     """
-    Store the scores of one or more minutes (one transaction). Each row:
-    timestamp, combo_pct (stored as `prediction`), price, dir_pct, move_pct,
-    raw_move, raw_dir, price_position_15m, price_position_1h (stored in the
-    price_position_60m column).
+    Store the model scores of one minute. Called once per minute per active bot.
+    combo = raw_move x raw_dir (the buy score); price_position_60m holds the
+    feature price_position_1h, the strategy's 60-minute price position.
+    Explicitly converts to Python float to avoid numpy float issues
+    with SQLite's type system.
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        for r in rows:
-            cursor.execute('''
-                INSERT INTO predictions (bot_id, timestamp, prediction, price, dir_pct, move_pct,
-                                         raw_move, raw_dir, price_position_15m, price_position_60m)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (bot_id, str(r['timestamp']), float(r['combo_pct']), float(r['price']),
-                  _sql_float(r.get('dir_pct')), _sql_float(r.get('move_pct')),
-                  _sql_float(r.get('raw_move')), _sql_float(r.get('raw_dir')),
-                  _sql_float(r.get('price_position_15m')), _sql_float(r.get('price_position_1h'))))
+        cursor.execute("""
+            INSERT INTO predictions (bot_id, timestamp, combo, raw_move, raw_dir, price,
+                                     price_position_15m, price_position_60m)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (bot_id, timestamp, float(combo), _sql_float(raw_move), _sql_float(raw_dir),
+              float(price), _sql_float(price_position_15m), _sql_float(price_position_60m)))
 
 
 def insert_capital_snapshot(bot_id, timestamp, closed_capital_sol, open_position_sol, cumulative_fees_sol):
@@ -1061,6 +917,54 @@ def get_last_modified_timestamps():
             'capital': capital_modified,
             'ohlcv': ohlcv_modified
         }
+
+
+def get_change_markers():
+    """
+    Cheap fingerprints of everything the dashboard shows, for the live update
+    stream (/api/stream). The stream compares successive results and tells the
+    browser which parts changed, so the page only refetches what is new.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        markers = {}
+
+        # Per-bot state the cards and panels display (status, position, phase,
+        # capital, config). Any change in these columns changes the string.
+        cursor.execute("""
+            SELECT c.id, c.updated_at, c.debug_mode, c.pool_address, c.strategy_name,
+                   r.status, r.pid, r.initializing,
+                   t.position, t.trade_phase, t.shares_held, t.current_capital_sol,
+                   t.entry_price_sol, t.n_reentries, t.trades_count, t.below_floor_count,
+                   t.last_sell_idx
+            FROM bot_config c
+            JOIN bot_runtime r ON c.id = r.bot_id
+            JOIN bot_trading_state t ON c.id = t.bot_id
+            ORDER BY c.id
+        """)
+        markers['bots'] = '|'.join(','.join(str(v) for v in tuple(row)) for row in cursor.fetchall())
+
+        cursor.execute('SELECT MAX(last_modified) AS m, COUNT(*) AS n FROM trades')
+        row = cursor.fetchone()
+        markers['trades'] = f"{row['m']}|{row['n']}"
+
+        cursor.execute('SELECT bot_id, MAX(timestamp) AS ts FROM capital_history GROUP BY bot_id')
+        markers['capital'] = {str(r['bot_id']): r['ts'] for r in cursor.fetchall()}
+
+        cursor.execute('SELECT MAX(timestamp) AS ts FROM wallet_capital_history')
+        markers['wallet_capital'] = cursor.fetchone()['ts']
+
+        cursor.execute('SELECT wallet_initialized, wallet_sol, total_fees_sol, trading_mode FROM global_settings WHERE id = 1')
+        row = cursor.fetchone()
+        markers['wallet'] = ','.join(str(v) for v in tuple(row)) if row else None
+
+        cursor.execute('SELECT bot_id, MAX(timestamp) AS ts FROM ohlcv_data GROUP BY bot_id')
+        markers['ohlcv'] = {str(r['bot_id']): r['ts'] for r in cursor.fetchall()}
+
+        cursor.execute('SELECT MAX(id) AS m FROM system_logs')
+        markers['logs'] = cursor.fetchone()['m']
+
+        return markers
 
 
 # ============================================
@@ -1490,7 +1394,7 @@ def deallocate_from_bot(bot_id):
             UPDATE bot_config
             SET pool_address = NULL, coin_symbol = NULL,
                 coin_image_thumb_base64 = NULL, coin_image_small_base64 = NULL,
-                coin_assigned_at = NULL,
+                coin_assigned_at = NULL, strategy_name = NULL,
                 updated_at = ?
             WHERE id = ?
         ''', (datetime.now(), bot_id))
@@ -1512,8 +1416,7 @@ def deallocate_from_bot(bot_id):
                 n_reentries = 0,
                 last_sell_close = NULL, last_sell_idx = NULL,
                 latest_activation_pct = NULL,
-                trade_phase = 'normal', below_floor_count = 0, max_price_seen = NULL,
-                strategy_state = NULL
+                trade_phase = 'normal', below_floor_count = 0, max_price_seen = NULL
             WHERE bot_id = ?
         ''', (bot_id,))
 

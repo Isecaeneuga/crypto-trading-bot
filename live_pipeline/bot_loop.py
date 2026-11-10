@@ -2,26 +2,20 @@
 Bot Loop - Main orchestrator for each trading bot process.
 Launched as a subprocess per bot by bot_manager.py.
 
-Flow per closed minute:
-    fetch OHLCV -> features (features.py, the Dataset_creationV9 code) -> move + direction
-    models -> percentile scores (scoring.py) -> strategy state machine
-    (strategy.py: A50, rebase mode) -> execute -> record
+Flow: fetch data -> compute features -> score -> decide -> execute -> record
 
-Strategy (see strategy.py for the exact order of checks):
-  * buy when combo_pct >= confidence_threshold, both price-position filters
-    pass, the coin is >= 720 minutes old and the re-entry rule allows it;
-  * sell at the take-profit; the loss floor and the stale time never sell,
-    they start races that may re-anchor (rebase) the position;
-  * the signal exit is OFF unless strategy_config.signal_exit_enabled is set.
+Data: the coin's full available 1-minute history from its first candle, filled as the
+data notebooks do (every zero-volume minute flat at the last real close). The V9
+features (features.py) are computed from that history; the move and direction models
+(scoring.py) give combo = P(move) x P(direction), the buy score.
 
-Minute index = row index of the forward-filled OHLCV = minutes since the coin's
-first minute, exactly as in the research data. The bot therefore always holds
-the coin's FULL history (fetched on the first start, kept in ohlcv_data).
-
-The state machine (strategy.StrategyState) is persisted as JSON after every
-minute, so a restart resumes the same position and the same race / re-entry
-state. Minutes missed while the bot was down are replayed through the state
-machine on restart (no buys on past minutes; a due sell is executed at once).
+Trade state machine (strategy.py, hard-coded parameters):
+  - position == 'closed':  look for an entry candidate (combo >= combo_cutoff + price
+                           positions + re-entry threshold)
+  - position == 'open':    drive the per-minute state machine
+        * three phases:  NORMAL  ->  STALE_RACE / LOSS_FLOOR_RACE
+        * priority within a minute: activation > loss-floor > stale
+        * in a race, a qualifying candidate re-bases the trade (no new buy)
 """
 
 import argparse
@@ -35,35 +29,35 @@ from datetime import datetime
 from database import (
     get_bot, get_global_settings, get_latest_sol_price,
     update_bot_runtime, update_bot_trading_state,
-    insert_ohlcv_data, insert_predictions,
+    insert_ohlcv_data, insert_prediction,
     insert_open_trade,
     update_trade_on_exit, get_open_trade_for_bot,
     deduct_trading_fee, get_bot_cumulative_fees_sol,
     insert_capital_snapshot, log_message,
     get_latest_timestamp, get_latest_ohlcv, get_all_ohlcv,
-    get_strategy_config, sync_strategy_config_from_file,
-    insert_wallet_capital_snapshot, get_wallet_status, get_all_bots_from_db,
-    DEFAULT_MODEL_DIR
+    insert_wallet_capital_snapshot, get_wallet_status, get_all_bots_from_db
 )
-from features import compute_live_features, display_columns, check_minute_grid, START_IDX
-from scoring import LiveScorer
+from features import LiveFeatureEngine, START_IDX
+from scoring import LiveScorer, verify_models
 from strategy import (
-    SignalExitStrategy, StrategyState, MinuteInput, is_legacy_config,
-    ACTION_BUY, ACTION_SELL, REASON_TAKE_PROFIT, REASON_SIGNAL_EXIT,
-    PHASE_NORMAL, DEFAULT_MAX_PRICE_IMPACT_PCT, SIGNAL_EXIT_PARAMS
+    TUNED_PARAMS, FIXED_PARAMS, PRICE_POSITION_60M_FEATURE, use_strategy,
+    passes_entry_filters, passes_reentry_threshold,
+    step_open_position, compute_exit_price,
+    PHASE_NORMAL, PHASE_STALE_RACE, PHASE_LOSS_FLOOR_RACE
 )
 from execution import execute_buy, execute_sell
 from data_collection import (
     fetch_historical_ohlcv,
-    fetch_ohlcv_from_timestamp,
     fetch_ohlcv_since,
-    forward_fill_missing_minutes
+    fetch_ohlcv_from_timestamp,
+    backfill_missing_candles
 )
 
-OHLCV_COLS = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-DISPLAY_COLS = ['returns', 'completed_pump', 'vol_120', 'estimated_sol_1pct_impact',
-                'liquidity_sample_age_minutes', 'liquidity_estimate_std_pct']
-CHART_BACKFILL_MINUTES = 240      # scores computed at start-up for the chart
+# ========================================================================
+# CONSTANTS
+# ========================================================================
+
+OHLCV_COLS = ['open', 'high', 'low', 'close', 'volume']
 
 # ========================================================================
 # HELPERS
@@ -97,6 +91,84 @@ def format_price_si(value):
             return f'{scaled:.2f}{sym}'
     # Below femto — fallback (extremely unlikely for any real price)
     return f'{value:.1e}'
+
+
+def get_entry_idx(all_data, entry_timestamp):
+    """Look up DataFrame index from stored entry timestamp."""
+    if not entry_timestamp:
+        return None
+    mask = all_data['timestamp'].astype(str) == entry_timestamp
+    matches = all_data.index[mask]
+    return int(matches[0]) if len(matches) > 0 else None
+
+def _ohlcv_record(row):
+    """Build the OHLCV dict for one DataFrame row, as stored in ohlcv_data.
+
+    Single source of truth for the column set written by every insert path
+    (historical load, gap backfill, live minute, force sell).
+    """
+    return {
+        'timestamp': str(row['timestamp']),
+        'open': row['open'], 'high': row['high'],
+        'low': row['low'], 'close': row['close'],
+        'volume': row['volume'], 'bot_action': row['bot_action'],
+        'backfilled': row.get('backfilled'),
+        'estimated_sol_1pct_impact': row.get('estimated_sol_1pct_impact'),
+    }
+
+
+def _last_real_close(all_data, upto):
+    """Close of the last real (volume > 0) candle among rows [0, upto), or None."""
+    vol = all_data['volume'].to_numpy(dtype=np.float64)[:upto]
+    real = np.flatnonzero(vol > 0)
+    return float(all_data['close'].iat[int(real[-1])]) if len(real) else None
+
+
+def _store_liquidity(all_data, engine, start_idx):
+    """Copy the engine's liquidity estimate into all_data for rows >= start_idx (for the
+    ohlcv_data table and the buy-size cap)."""
+    if 'estimated_sol_1pct_impact' not in all_data.columns:
+        all_data['estimated_sol_1pct_impact'] = np.nan
+    est = engine.liq.arrays()[0]
+    all_data.loc[start_idx:, 'estimated_sol_1pct_impact'] = est[start_idx:len(all_data)]
+    return all_data
+
+
+def _correct_last_minute_if_changed(all_data, refetched_row, engine, rel_tol=1e-4):
+    """Re-check the most recent stored minute against a fresh fetch and repair it
+    if GeckoTerminal revised it after our read.
+
+    The just-closed candle can be read while still provisional; by the next poll
+    (~60s later) it is finalized. The refetched candle first gets the same fill rule as
+    every other minute (zero volume -> flat at the last real close). If it differs from
+    the stored row, the row is overwritten and the feature engine re-processes it, so a
+    provisional value cannot leak into later features.
+
+    Returns (all_data, changed: bool).
+    """
+    last_idx = len(all_data) - 1
+    stored = all_data.iloc[last_idx]
+
+    fixed = {c: float(refetched_row[c]) for c in OHLCV_COLS}
+    if fixed['volume'] <= 0:
+        prc = _last_real_close(all_data, last_idx)
+        if prc is None:                      # no real candle yet: the fill uses the row's own close
+            prc = fixed['close']
+        fixed.update(open=prc, high=prc, low=prc, close=prc, volume=0.0)
+
+    changed = any(
+        abs(fixed[c] - float(stored[c])) > rel_tol * max(abs(float(stored[c])), 1e-12)
+        for c in OHLCV_COLS
+    )
+    if not changed:
+        return all_data, False
+
+    for c in OHLCV_COLS:
+        all_data.at[last_idx, c] = fixed[c]
+    all_data.at[last_idx, 'backfilled'] = int(fixed['volume'] <= 0)
+    engine.revise(all_data, last_idx)
+    all_data = _store_liquidity(all_data, engine, last_idx)
+    return all_data, True
 
 
 def check_force_sell_files(bot_id):
@@ -153,647 +225,917 @@ def write_wallet_snapshot():
         pass  # Non-critical
 
 
-
-def _ohlcv_record(all_data, idx):
-    """The ohlcv_data row of minute idx (OHLCV + display columns + action)."""
-    row = all_data.iloc[idx]
-    action = row.get('bot_action')
-    rec = {'timestamp': str(row['timestamp']), 'open': row['open'], 'high': row['high'],
-           'low': row['low'], 'close': row['close'], 'volume': row['volume'],
-           'bot_action': action if isinstance(action, str) else None}
-    for c in DISPLAY_COLS:
-        rec[c] = row.get(c)
-    if rec.get('completed_pump') is not None and pd.isna(rec['completed_pump']):
-        rec['completed_pump'] = None
-    return rec
-
-
-def _fill_display_columns(all_data, first, last, feats=None):
-    """Display columns for rows first..last. Cheap columns from a recent slice;
-    the liquidity estimate from the feature frame (the same causal estimate the
-    sizing uses), falling back to NaN for rows without features."""
-    lo = max(0, first - 130)
-    part = all_data.iloc[lo:last + 1]
-    close = part['close'].astype(float)
-    ret = close.pct_change(fill_method=None)
-    vol = ret.rolling(120, min_periods=120).std()
-    rmin = close.rolling(31, min_periods=31).min()
-    pump = ((close - rmin) / rmin >= 0.10).astype(int)
-    for idx in range(first, last + 1):
-        k = idx - lo
-        all_data.at[idx, 'returns'] = ret.iloc[k]
-        all_data.at[idx, 'vol_120'] = vol.iloc[k]
-        all_data.at[idx, 'completed_pump'] = int(pump.iloc[k]) if idx >= 30 else 0
-    if feats is not None:
-        f = feats.set_index('minute_idx')
-        for c in ('estimated_sol_1pct_impact', 'liquidity_sample_age_minutes', 'liquidity_estimate_std_pct'):
-            for idx in range(first, last + 1):
-                if idx in f.index:
-                    all_data.at[idx, c] = f.at[idx, c]
-
-
-def _ts_utc(ts):
-    t = pd.Timestamp(ts)
-    return (t.tz_localize('UTC') if t.tzinfo is None else t.tz_convert('UTC')).isoformat()
-
-
-def _append_minutes(all_data, new_df, timezone, bot_id):
-    """Append fetched candles to the full history on a gap-free minute grid,
-    with the research fill rule (data_collection.forward_fill_missing_minutes;
-    the last stored minute anchors the last real close)."""
-    if new_df is None or len(new_df) == 0:
-        return all_data, 0
-    tail = all_data[OHLCV_COLS].iloc[[-1]]
-    merged = pd.concat([tail, new_df[OHLCV_COLS]], ignore_index=True)
-    merged = forward_fill_missing_minutes(merged, timezone, bot_id, log=False,
-                                          anchor_first_row=True).iloc[1:]
-    merged = merged[merged['timestamp'] > all_data['timestamp'].iloc[-1]]
-    if len(merged) == 0:
-        return all_data, 0
-    merged = merged.assign(bot_action=None)
-    for c in DISPLAY_COLS:
-        merged[c] = np.nan
-    out = pd.concat([all_data, merged], ignore_index=True)
-    return out, len(merged)
-
-
-def _correct_last_minute_if_changed(all_data, refetched_row, rel_tol=1e-4):
-    """Re-check the most recent stored minute against a fresh fetch and overwrite
-    it if GeckoTerminal revised it after our read. The features are recomputed
-    from the raw OHLCV every minute, so nothing else needs repairing (the
-    state machine already acted on the provisional value; that cannot be undone).
-    The fetched candle is first put on the research fill rule: with zero volume
-    it is a flat candle at the last real close (= the previous stored close,
-    which is already on the rule). Returns (all_data, changed)."""
-    last_idx = len(all_data) - 1
-    stored = all_data.iloc[last_idx]
-    cols = ['open', 'high', 'low', 'close', 'volume']
-    new = {c: float(refetched_row[c]) for c in cols}
-    if new['volume'] <= 0:
-        flat = float(all_data['close'].iloc[last_idx - 1]) if last_idx > 0 else new['close']
-        new.update(open=flat, high=flat, low=flat, close=flat, volume=0.0)
-    changed = any(abs(new[c] - float(stored[c]))
-                  > rel_tol * max(abs(float(stored[c])), 1e-12) for c in cols)
-    if changed:
-        for c in cols:
-            all_data.at[last_idx, c] = new[c]
-    return all_data, changed
-
-
-def _strategy_summary(engine):
-    c = engine.cfg
-    tp = (f"take-profit +{c['activation_threshold'] * 100:.1f}% (peak close vs the segment reference)"
-          if engine.tp_enabled else "take-profit OFF")
-    se = (f"signal exit ON (direction < {c['se_dir']:.3f} or move < {c['se_move']:.3f} after "
-          f"{c['se_min_hold']} min)" if engine.signal_on else "signal exit OFF")
-    return (f"Strategy A50, rebase mode: buy if combo >= {c['confidence_threshold']:.4f}, "
-            f"pp15m <= {c['max_price_position_15m']:.3f}, pp1h <= {c['max_price_position_60m']:.3f}, "
-            f"coin age >= {c['trading_start_minutes']} min; {tp}; loss floor "
-            f"-{c['loss_floor_pct'] * 100:.1f}% x {c['loss_floor_consecutive_minutes']} min and stale "
-            f"{c['stale_trade_minutes']} min start races (never sell); re-entry "
-            f"{c['reentry_threshold_pct'] * 100:.2f}% below the sale, relaxing "
-            f"{c['reentry_decay_rate'] * 100:.3f}%/min after {c['reentry_decay_start_minutes']} min; {se}")
-
-
-# ========================================================================
-# THE BOT
-# ========================================================================
-
-class Bot:
-    def __init__(self, bot_id):
-        self.bot_id = bot_id
-        g = get_global_settings()
-        b = get_bot(bot_id)
-        if not b or b['status'] == 'inactive':
-            log_message(f"Bot {bot_id} not configured", bot_id, 'ERROR')
-            sys.exit(1)
-        if not g:
-            log_message("Global settings not found", bot_id, 'ERROR')
-            sys.exit(1)
-        self.tz = g['timezone']
-        self.finalization_lag = g['finalization_lag_minutes']
-        self.historical_days = g['historical_days'] or 30
-        self.mode = g.get('trading_mode', 'paper')
-        self.model_dir = g.get('model_dir') or DEFAULT_MODEL_DIR
-        self.pool = b['pool_address']
-        self.coin = b['coin_symbol']
-        # Paper-mode static fee (global, chosen at wallet init); falls back to
-        # the per-bot slippage. Shadow/live derive real costs from quotes.
-        slip = g.get('static_trading_fee_pct')
-        self.slippage = slip if slip is not None else b['slippage_pct']
-        self.grace = int(g.get('grace_period_seconds') or 5) if self.mode == 'paper' else 0
-        self.initial_capital = b['initial_capital_sol']
-        self.max_impact = b.get('max_price_impact_pct') or DEFAULT_MAX_PRICE_IMPACT_PCT
-
-        self.swap_ctx = None
-        if self.mode in ('shadow', 'live'):
-            from data_collection import resolve_token_mint_and_decimals
-            mint, decimals = resolve_token_mint_and_decimals(self.pool, bot_id)
-            if mint is None or decimals is None:
-                log_message(f"Could not resolve token mint/decimals — required for {self.mode} mode. "
-                            f"Exiting.", bot_id, 'ERROR')
-                sys.exit(1)
-            self.swap_ctx = {'token_mint': mint, 'token_decimals': decimals,
-                             'slippage_bps': int(round((b.get('slippage_pct') or 0.015) * 10000)),
-                             'wallet_pubkey': g.get('wallet_pubkey'), 'bot_id': bot_id}
-            log_message(f"{self.mode.capitalize()} swap context ready: {mint} ({decimals} decimals)",
-                        bot_id, 'INFO')
-
-        # ---- strategy + models ----
-        cfg = sync_strategy_config_from_file() or get_strategy_config()
-        if not cfg or is_legacy_config(cfg):
-            log_message("No valid strategy config (best_params.json missing or the old 5-tier "
-                        "config is still stored). Exiting.", bot_id, 'ERROR')
-            sys.exit(1)
-        try:
-            self.engine = SignalExitStrategy(cfg)
-        except Exception as e:
-            log_message(f"Invalid strategy config: {e}. Exiting.", bot_id, 'ERROR')
-            sys.exit(1)
-        log_message(_strategy_summary(self.engine), bot_id, 'INFO')
-        if not self.engine.signal_on and any(k in cfg for k in SIGNAL_EXIT_PARAMS):
-            log_message("Note: these parameters come from a run tuned WITH the signal exit, which is "
-                        "switched off here; upload parameters tuned without it for the plain strategy.",
-                        bot_id, 'WARNING')
-        try:
-            self.scorer = LiveScorer(self.model_dir)
-        except Exception as e:
-            log_message(f"Could not load the models from {self.model_dir}: {e}. Exiting.", bot_id, 'ERROR')
-            sys.exit(1)
-        log_message(f"Models loaded from {self.model_dir}: move ({len(self.scorer.move_features)} "
-                    f"features), direction ({len(self.scorer.dir_features)} features)", bot_id, 'INFO')
-
-        sol = get_latest_sol_price()
-        self.sol_usd = sol['price_usd'] if sol else 130.0
-        os.makedirs(f'data/bot_{bot_id}', exist_ok=True)
-
-        # runtime state (refreshed from the DB each loop)
-        self.capital = b['current_capital_sol'] or 0.0
-        self.shares = b['shares_held'] or 0.0
-        self.trades_count = b['trades_count'] or 0
-        self.all_data = None
-        self.state = None
-        self.latest = {}          # latest minute's scores (for the log line)
-
-    # ------------------------------------------------------------------ data
-    def load_history(self):
-        """Fresh start: fetch the coin's full history. Resume: load it from the
-        DB and fill the gap. Returns the index of the first minute that still
-        needs the state machine (None on a fresh start)."""
-        bid = self.bot_id
-        last_ts = get_latest_timestamp(bid)
-        if last_ts is None:
-            log_message("Fresh start: fetching the coin's full history...", bid, 'INFO')
-            num_batches = int(self.historical_days * 1.5) + 1
-            df = fetch_historical_ohlcv(self.pool, num_batches, self.tz, bid)
-            if df is None or len(df) == 0:
-                log_message("Could not fetch historical data", bid, 'ERROR')
-                sys.exit(1)
-            if not df.attrs.get('reached_start'):
-                log_message(f"The history does not reach the coin's first minute within "
-                            f"{self.historical_days} days ({num_batches} batches): the features "
-                            f"(minutes since launch, launch / ATH features, the 720-min trading start) "
-                            f"would not match the research data. Not starting; raise historical_days "
-                            f"if the coin is older.", bid, 'ERROR')
-                sys.exit(1)
-            df = forward_fill_missing_minutes(df, self.tz, bid)
-            df['bot_action'] = None
-            disp = display_columns(df)
-            for c in DISPLAY_COLS:
-                df[c] = disp[c].to_numpy()
-            self.all_data = df.reset_index(drop=True)
-            log_message(f"Retrieved the full history: {len(df)} minutes "
-                        f"({len(df) / 1440:.1f} days since the first candle)", bid, 'INFO')
-            insert_ohlcv_data(bid, [_ohlcv_record(self.all_data, i) for i in range(len(self.all_data))])
-            return None
-
-        log_message("Resuming: loading the stored history...", bid, 'INFO')
-        rows = get_all_ohlcv(bid)
-        df = pd.DataFrame(rows)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_convert(self.tz)
-        for c in ['open', 'high', 'low', 'close', 'volume']:
-            df[c] = df[c].astype(float)
-        df = df.sort_values('timestamp').drop_duplicates('timestamp', keep='last').reset_index(drop=True)
-        if not check_minute_grid(df):
-            n0 = len(df)
-            actions = df.set_index('timestamp')['bot_action']
-            df = forward_fill_missing_minutes(df[OHLCV_COLS], self.tz, bid)
-            df['bot_action'] = df['timestamp'].map(actions)
-            log_message(f"Stored history had gaps: forward-filled {len(df) - n0} minutes", bid, 'WARNING')
-        for c in DISPLAY_COLS:
-            df[c] = np.nan
-        self.all_data = df
-        n_stored = len(df)
-        log_message(f"Loaded {n_stored} stored minutes", bid, 'INFO')
-
-        since = int(df['timestamp'].iloc[-1].timestamp())
-        gap = fetch_ohlcv_since(self.pool, since, self.tz, bid)
-        if gap is not None and len(gap):
-            gap = gap[gap['timestamp'] <= self._cutoff()]
-            recheck = gap[gap['timestamp'] == df['timestamp'].iloc[-1]]
-            if len(recheck) == 1:
-                self.all_data, _ = _correct_last_minute_if_changed(self.all_data, recheck.iloc[0])
-            self.all_data, n_new = _append_minutes(self.all_data, gap[gap['timestamp'] > df['timestamp'].iloc[-1]],
-                                                   self.tz, bid)
-        else:
-            n_new = 0
-        if not check_minute_grid(self.all_data):
-            raise RuntimeError("history is not a gap-free minute grid after the gap fill")
-        log_message(f"Gap filled: {n_new} new minutes", bid, 'INFO')
-        return n_stored          # minutes from here on are new
-
-    def _cutoff(self):
-        now = datetime.now(tz=pd.Timestamp.now(tz=self.tz).tz)
-        return (pd.Timestamp(now) - pd.Timedelta(minutes=self.finalization_lag)).replace(second=0, microsecond=0)
-
-    # ------------------------------------------------------------------ state
-    def load_state(self, bot_row):
-        """The persisted state machine, or a best-effort hand-over from the old
-        5-tier version (no saved state machine)."""
-        bid = self.bot_id
-        coin_start = _ts_utc(self.all_data['timestamp'].iloc[0])
-        if bot_row.get('strategy_state'):
-            st = StrategyState.from_json(bot_row['strategy_state'])
-            if st.coin_start and st.coin_start != coin_start:
-                shift = int((pd.Timestamp(coin_start) - pd.Timestamp(st.coin_start)).total_seconds() // 60)
-                log_message(f"Stored history starts {shift} min after the saved state's minute 0; "
-                            f"shifting the state's minute indices", bid, 'WARNING')
-                for f in ('last_idx', 'last_sell_idx', 'block_ref_idx', 'orig_entry_idx',
-                          'seg_entry_idx', 'trade_ref_idx'):
-                    v = getattr(st, f)
-                    if v is not None and v >= 0:
-                        setattr(st, f, v - shift)
-            st.coin_start = coin_start
-            return st
-
-        st = StrategyState(coin_start=coin_start)
-        if bot_row.get('last_sell_close') and bot_row.get('last_sell_idx') is not None:
-            st.last_sell_close = float(bot_row['last_sell_close'])
-            st.last_sell_idx = int(bot_row['last_sell_idx'])
-        if bot_row['position'] == 'open':
-            orig_idx = self._idx_of(bot_row.get('original_entry_timestamp') or bot_row.get('entry_timestamp'))
-            orig_price = bot_row.get('original_entry_price') or bot_row.get('entry_price_sol')
-            if orig_idx is None or not orig_price:
-                log_message("Open position from the old version cannot be located in the history; "
-                            "force-sell it manually.", bid, 'ERROR')
-                sys.exit(1)
-            self.engine.open_position(st, orig_idx, orig_price)
-            seg_idx = self._idx_of(bot_row.get('entry_timestamp'))
-            if seg_idx is not None and bot_row.get('entry_price_sol'):
-                st.seg_entry_idx, st.seg_entry_price = seg_idx, float(bot_row['entry_price_sol'])
-            log_message("Adopted an open position from the old 5-tier version: new state machine "
-                        "from a NORMAL phase (its old race state is not carried over).", bid, 'WARNING')
-        return st
-
-    def _idx_of(self, ts):
-        if not ts:
-            return None
-        t = pd.Timestamp(ts)
-        t = t.tz_localize(self.tz) if t.tzinfo is None else t
-        hit = np.flatnonzero((pd.to_datetime(self.all_data['timestamp'], utc=True) == t.tz_convert('UTC')).to_numpy())
-        return int(hit[0]) if len(hit) else None
-
-    def _ts(self, idx):
-        return str(self.all_data['timestamp'].iloc[idx])
-
-    def persist(self):
-        st, eng = self.state, self.engine
-        is_open = st.position == 'open'
-        update_bot_trading_state(
-            self.bot_id,
-            position=st.position,
-            shares_held=self.shares if is_open else 0,
-            entry_price_sol=st.seg_entry_price if is_open else None,
-            entry_timestamp=self._ts(st.seg_entry_idx) if is_open else None,
-            original_entry_price=st.orig_entry_price if is_open else None,
-            original_entry_timestamp=self._ts(st.orig_entry_idx) if is_open else None,
-            current_capital_sol=self.capital,
-            trades_count=self.trades_count,
-            n_reentries=st.n_reentries if is_open else 0,
-            last_sell_close=st.last_sell_close,
-            last_sell_idx=st.last_sell_idx,
-            latest_activation_pct=eng.act if eng.tp_enabled else None,
-            trade_phase=st.phase if is_open else PHASE_NORMAL,
-            below_floor_count=st.below_floor if is_open else 0,
-            max_price_seen=(st.max_price if is_open and st.max_price > 0 else None),
-            strategy_state=st.to_json(),
-        )
-
-    # ------------------------------------------------------------------ minutes
-    def process_minutes(self, first, last, allow_trading, catch_up=False, force_on_signal=False):
-        """Scores + state machine for minutes first..last (in order). Buys only
-        on `last` (the current minute); a sell decided on an earlier (backlog)
-        minute is executed at once, at the current minute. Returns True if a
-        sell-on-signal fired (the caller pauses the bot)."""
-        bid = self.bot_id
-        n_req = last - first + 1
-        feats = compute_live_features(self.all_data, last_n=n_req)
-        _fill_display_columns(self.all_data, first, last, feats)
-        if feats is None:
-            self.state.last_idx = max(self.state.last_idx, last)
-            return False
-        sc = self.scorer.score(feats)
-        pred_rows = []
-        minutes = []
-        for k, idx in enumerate(feats['minute_idx'].to_numpy()):
-            idx = int(idx)
-            close = float(self.all_data['close'].iloc[idx])
-            m = MinuteInput(idx=idx, close=close, combo_pct=float(sc['combo_pct'][k]),
-                            dir_pct=float(sc['dir_pct'][k]), move_pct=float(sc['move_pct'][k]),
-                            pp_15m=float(feats['price_position_15m'].iloc[k]),
-                            pp_1h=float(feats['price_position_1h'].iloc[k]))
-            minutes.append((m, float(feats['estimated_sol_1pct_impact'].iloc[k])))
-            pred_rows.append({'timestamp': self._ts(idx), 'combo_pct': m.combo_pct, 'price': close,
-                              'dir_pct': m.dir_pct, 'move_pct': m.move_pct,
-                              'raw_move': float(sc['raw_move'][k]), 'raw_dir': float(sc['raw_dir'][k]),
-                              'price_position_15m': m.pp_15m, 'price_position_1h': m.pp_1h})
-        insert_predictions(bid, pred_rows)
-        self.latest = {'combo': minutes[-1][0].combo_pct, 'dir': minutes[-1][0].dir_pct,
-                       'move': minutes[-1][0].move_pct}
-
-        paused_by_signal = False
-        for m, liq in minutes:
-            if m.idx <= self.state.last_idx:
-                continue
-            is_current = (m.idx == last) and allow_trading and not catch_up
-            res = self.engine.step(self.state, m)
-            for ev in res.events:
-                log_message(f"{ev} @ {self._ts(m.idx)[11:16]}", bid,
-                            'WARNING' if 'loss floor armed' in ev else 'INFO')
-            if res.action == ACTION_BUY:
-                if is_current:
-                    self.execute_buy(m, liq)
-                elif not catch_up:
-                    log_message(f"Entry signal on a backlog minute ({self._ts(m.idx)[11:16]}) — not "
-                                f"bought (only the current minute is traded)", bid, 'INFO')
-            elif res.action == ACTION_SELL:
-                if not allow_trading:
-                    log_message(f"Sell signal ({res.reason}) while not running — not executed", bid, 'WARNING')
-                    continue
-                reason = self._reason_label(res.reason)
-                if force_on_signal:
-                    reason = f"Force sell on signal ({reason})"
-                late = m.idx != last
-                self.execute_sell(last, reason + (f" [signal at {self._ts(m.idx)[11:16]}, filled late]"
-                                                  if late else ""))
-                if force_on_signal:
-                    paused_by_signal = True
-                break                   # minutes after the sale were consumed by close_position
-        self.state.last_idx = max(self.state.last_idx, last)
-        return paused_by_signal
-
-    def _reason_label(self, reason):
-        if reason == REASON_TAKE_PROFIT:
-            return f"Take-profit (peak +{self.engine.act * 100:.1f}% over the reference)"
-        if reason == REASON_SIGNAL_EXIT:
-            return "Signal exit"
-        return reason
-
-    # ------------------------------------------------------------------ orders
-    def execute_buy(self, m, liq):
-        bid, eng = self.bot_id, self.engine
-        amount, cap = eng.buy_amount(self.capital, liq, self.max_impact)
-        if amount <= 0:
-            log_message(f"Skipping buy at {format_price_si(m.close)}: buy amount {amount:.6f} SOL", bid, 'WARNING')
-            return
-        result = execute_buy(amount, m.close, self.slippage, self.mode, self.swap_ctx)
-        if result.get('used_fallback'):
-            log_message("Shadow buy used static fallback (no live quote)", bid, 'WARNING')
-        fee_capital = result.get('capital_fee_sol', 0) or 0     # real SOL burned (shadow/live)
-        self.capital = max(0.0, self.capital - amount - fee_capital)
-        self.shares = result['shares_received']
-        eng.open_position(self.state, m.idx, result['fill_price_sol'])
-        self.all_data.at[m.idx, 'bot_action'] = 'BUY'
-        ts = self._ts(m.idx)
-        insert_open_trade(bid, ts, result['fill_price_sol'], self.sol_usd, amount, result['fee_sol'])
-        deduct_trading_fee(result['fee_sol'])
-        self.persist()
-        cap_txt = f"{cap:.4f} SOL" if cap is not None else "n/a"
-        log_message(f"BUY at {format_price_si(result['fill_price_sol'])} SOL, spent {amount:.4f} SOL "
-                    f"(liquidity cap {cap_txt}), combo {m.combo_pct:.3f}, direction {m.dir_pct:.3f}, "
-                    f"move {m.move_pct:.3f}, pp15m {m.pp_15m:.2f}, pp1h {m.pp_1h:.2f}", bid, 'INFO')
-
-    def execute_sell(self, idx, reason):
-        """Sell the whole position at minute idx (the current minute)."""
-        bid, eng, st = self.bot_id, self.engine, self.state
-        close = float(self.all_data['close'].iloc[idx])
-        orig = st.orig_entry_price
-        orig_idx = st.orig_entry_idx
-        n_re = st.n_reentries
-        exit_fill = eng.exit_fill_price(close, self.slippage)       # paper: close x (1 - slippage)
-        result = execute_sell(self.shares, exit_fill, orig, self.initial_capital,
-                              self.slippage, self.mode, self.swap_ctx)
-        if result.get('used_fallback'):
-            log_message("Shadow sell used static fallback (no live quote)", bid, 'WARNING')
-        self.capital += result['proceeds_sol'] - (result.get('capital_fee_sol', 0) or 0)
-        self.all_data.at[idx, 'bot_action'] = 'SELL'
-        trade = get_open_trade_for_bot(bid)
-        if trade:
-            update_trade_on_exit(trade['id'], self._ts(idx), result['fill_price_sol'], self.sol_usd,
-                                 result['pnl_sol'], result['pnl_pct'], idx - orig_idx, reason,
-                                 result['fee_sol'])
-        deduct_trading_fee(result['fee_sol'])
-        eng.close_position(st, idx, close)
-        self.shares = 0.0
-        self.trades_count += 1
-        self.persist()
-        insert_ohlcv_data(bid, [_ohlcv_record(self.all_data, idx)])   # SELL marker for the chart
-        log_message(f"SELL {self.coin} at {format_price_si(result['fill_price_sol'])} SOL, "
-                    f"P&L {result['pnl_pct'] * 100:+.2f}% ({result['pnl_sol']:+.4f} SOL), held "
-                    f"{idx - orig_idx} min, rebases {n_re}, fee {result['fee_sol']:.6f} SOL, "
-                    f"reason: {reason}", bid, 'INFO')
-
-    # ------------------------------------------------------------------ snapshots
-    def snapshots(self, first, last):
-        fees = get_bot_cumulative_fees_sol(self.bot_id)
-        for idx in range(first, last + 1):
-            price = float(self.all_data['close'].iloc[idx])
-            open_val = self.shares * price if self.state.position == 'open' else 0.0
-            insert_capital_snapshot(self.bot_id, self._ts(idx), self.capital, open_val, fees)
-        write_wallet_snapshot()
-
-
 # ========================================================================
 # MAIN
 # ========================================================================
 
 def main():
+    # Parse args
     parser = argparse.ArgumentParser()
     parser.add_argument('--bot-id', type=int, required=True)
     args = parser.parse_args()
     BOT_ID = args.bot_id
 
-    bot = Bot(BOT_ID)
-    update_bot_runtime(BOT_ID, initializing=1)
-    first_new = bot.load_history()
-    bot_row = get_bot(BOT_ID)
-    bot.state = bot.load_state(bot_row)
-    n = len(bot.all_data)
+    # Load config from database
+    global_config = get_global_settings()
+    bot_config = get_bot(BOT_ID)
 
-    if first_new is None:
-        # Fresh start: nothing to replay. Score the recent minutes for the chart.
-        bot.state.last_idx = n - 1
-        lo = max(START_IDX, n - CHART_BACKFILL_MINUTES)
-        if lo <= n - 1:
-            bot.process_minutes(lo, n - 1, allow_trading=False, catch_up=True)
-    else:
-        # Resume: replay every minute the state machine has not seen yet
-        # (no buys on past minutes; a due sell is executed at once).
-        start = max(bot.state.last_idx + 1, first_new if bot_row.get('strategy_state') is None else 0)
-        start = max(start, n - 20000)
-        if start <= n - 1:
-            log_message(f"Replaying {n - start} minute(s) through the state machine", BOT_ID, 'INFO')
-            running = (get_bot(BOT_ID) or {}).get('status') == 'running'
-            bot.process_minutes(start, n - 1, allow_trading=running, catch_up=True)
-        if first_new < n:
-            insert_ohlcv_data(BOT_ID, [_ohlcv_record(bot.all_data, i) for i in range(first_new, n)])
-            bot.snapshots(max(first_new, n - 5), n - 1)
-    bot.persist()
+    if not bot_config or bot_config['status'] == 'inactive':
+        log_message(f"Bot {BOT_ID} not configured", BOT_ID, 'ERROR')
+        sys.exit(1)
+    if not global_config:
+        log_message(f"Global settings not found", BOT_ID, 'ERROR')
+        sys.exit(1)
 
-    start_timestamp_unix = int(bot.all_data['timestamp'].max().timestamp())
-    update_bot_runtime(BOT_ID, initializing=0)
-    log_message(f"Starting live trading for {bot.coin} (mode: {bot.mode}, "
-                f"{n} minutes of history, position {bot.state.position})", BOT_ID, 'INFO')
+    # Extract settings
+    TIMEZONE = global_config['timezone']
+    FINALIZATION_LAG_MINUTES = global_config['finalization_lag_minutes']
+    MODEL_DIR = global_config.get('model_dir') or 'artifacts'
 
+    # The bot's strategy (parameters + combo cutoff) from the model folder, the one chosen
+    # when the bot was set up (the first strategy file if none was stored); it must belong
+    # to the models in that folder. Loaded before the settings below use FIXED_PARAMS.
     try:
-        _prev_debug_mode = None
+        strategy_doc = use_strategy(MODEL_DIR, bot_config.get('strategy_name'))
+        verify_models(MODEL_DIR, strategy_doc)
+    except Exception as e:
+        log_message(f"Could not load the strategy: {e}", BOT_ID, 'ERROR')
+        sys.exit(1)
+    _sel = strategy_doc.get('selection', {})
+    log_message(f"Strategy '{strategy_doc['name']}' (run {_sel.get('run', '?')} of {_sel.get('n_runs', '?')}, "
+                f"chosen by {_sel.get('selected_by', '?')} score, test ${_sel.get('test_score', float('nan')):.2f})",
+                BOT_ID, 'INFO')
+    TRADING_MODE = global_config.get('trading_mode', 'paper')
+
+    POOL_ADDRESS = bot_config['pool_address']
+    COIN = bot_config['coin_symbol']
+    # Paper-mode static trading fee is a global setting chosen at wallet init;
+    # fall back to the per-bot slippage if it isn't set. (Shadow/live will later
+    # derive real fees from the transaction instead.)
+    SLIPPAGE_PCT = global_config.get('static_trading_fee_pct')
+    if SLIPPAGE_PCT is None:
+        SLIPPAGE_PCT = bot_config['slippage_pct']
+    if SLIPPAGE_PCT is None:
+        SLIPPAGE_PCT = FIXED_PARAMS['slippage_pct']
+    # Per-minute grace period (seconds) chosen at wallet init. Paper only —
+    # shadow/live quote at decision time and don't use a grace window.
+    GRACE_PERIOD_SECONDS = int(global_config.get('grace_period_seconds') or 5)
+    if TRADING_MODE != 'paper':
+        GRACE_PERIOD_SECONDS = 0
+
+    # Shadow/live swap context: resolve the base token mint + decimals once so
+    # execute_buy/execute_sell can quote real Jupiter swaps at decision time.
+    # (Paper never quotes, so SWAP_CTX stays None.)
+    SWAP_CTX = None
+    if TRADING_MODE in ('shadow', 'live'):
+        from data_collection import resolve_token_mint_and_decimals
+        _mint, _decimals = resolve_token_mint_and_decimals(POOL_ADDRESS, BOT_ID)
+        if _mint is None or _decimals is None:
+            log_message(
+                "Could not resolve token mint/decimals — required for "
+                f"{TRADING_MODE} mode. Exiting.", BOT_ID, 'ERROR'
+            )
+            sys.exit(1)
+        SWAP_CTX = {
+            'token_mint': _mint,
+            'token_decimals': _decimals,
+            'slippage_bps': int(round((bot_config.get('slippage_pct') or 0.015) * 10000)),
+            'wallet_pubkey': global_config.get('wallet_pubkey'),
+            'bot_id': BOT_ID,
+        }
+        log_message(
+            f"{TRADING_MODE.capitalize()} swap context ready: {_mint} "
+            f"({_decimals} decimals)", BOT_ID, 'INFO'
+        )
+
+    INITIAL_CAPITAL_SOL = bot_config['initial_capital_sol']
+    # Per-bot liquidity cap on buy size (the notebook's desired_price_impact_pct):
+    # buy at most estimated_sol_1pct_impact * (pct * 100) SOL.
+    DESIRED_PRICE_IMPACT_PCT = (bot_config.get('max_price_impact_pct')
+                                or FIXED_PARAMS['desired_price_impact_pct'])
+
+    os.makedirs(f'data/bot_{BOT_ID}', exist_ok=True)
+
+    # Load the move + direction models (combo = P_move x P_dir)
+    log_message(f"Loading the move and direction models from {MODEL_DIR}/ ...", BOT_ID, 'INFO')
+    try:
+        scorer = LiveScorer(MODEL_DIR)
+    except Exception as e:
+        log_message(f"Could not load the models: {e}", BOT_ID, 'ERROR')
+        sys.exit(1)
+    log_message(
+        f"Models loaded (move {len(scorer.move_features)} features, direction "
+        f"{len(scorer.dir_features)} features); buy when combo >= "
+        f"{TUNED_PARAMS['combo_cutoff']:.6f}", BOT_ID, 'INFO')
+
+    # Get SOL price
+    sol_price_data = get_latest_sol_price()
+    SOL_PRICE_USD = sol_price_data['price_usd'] if sol_price_data else 130.0
+
+    # Mark the bot as initialising while it collects historical/gap data. The
+    # dashboard shows this state (blue card + INITIALISING badge) until live
+    # trading begins. The manager health-check only touches `status`, so it
+    # won't clear this flag.
+    update_bot_runtime(BOT_ID, initializing=1)
+
+    # Check if this is a fresh start or a resume
+    last_stored_timestamp = get_latest_timestamp(BOT_ID)
+
+    def _finalized_cutoff():
+        cutoff = datetime.now(tz=pd.Timestamp.now(tz=TIMEZONE).tz) - pd.Timedelta(minutes=FINALIZATION_LAG_MINUTES)
+        return cutoff.replace(second=0, microsecond=0)
+
+    if last_stored_timestamp is None:
+        # FRESH START — fetch the full available history (from the coin's first candle)
+        log_message("Fresh start: fetching the full history...", BOT_ID, 'INFO')
+        all_data = fetch_historical_ohlcv(POOL_ADDRESS, TIMEZONE, BOT_ID)
+
+        if all_data is None or len(all_data) == 0:
+            log_message("Could not fetch the historical data", BOT_ID, 'ERROR')
+            sys.exit(1)
+
+        all_data = all_data[all_data['timestamp'] <= _finalized_cutoff()]
+        all_data = backfill_missing_candles(all_data)
+        all_data['bot_action'] = None
+        log_message(f"Retrieved {len(all_data)} candles from {all_data['timestamp'].iloc[0]}",
+                    BOT_ID, 'INFO')
+
+        log_message("Computing the liquidity history...", BOT_ID, 'INFO')
+        engine = LiveFeatureEngine(all_data[['timestamp'] + OHLCV_COLS])
+        all_data = _store_liquidity(all_data, engine, 0)
+
+        # Save to database
+        log_message("Saving historical data to database...", BOT_ID, 'INFO')
+        insert_ohlcv_data(BOT_ID, [_ohlcv_record(all_data.iloc[idx]) for idx in range(len(all_data))])
+
+    else:
+        # RESUME — load the stored history and fetch the gap
+        log_message("Resuming: loading existing OHLCV from database...", BOT_ID, 'INFO')
+
+        existing_ohlcv = get_all_ohlcv(BOT_ID)
+        if not existing_ohlcv:
+            log_message("No existing OHLCV found despite timestamp existing", BOT_ID, 'ERROR')
+            sys.exit(1)
+
+        all_data = pd.DataFrame(existing_ohlcv)
+        all_data['timestamp'] = pd.to_datetime(all_data['timestamp'], utc=True).dt.tz_convert(TIMEZONE)
+        for col in OHLCV_COLS:
+            all_data[col] = all_data[col].astype(float)
+        all_data = all_data[['timestamp'] + OHLCV_COLS + ['bot_action', 'backfilled']]
+        all_data = all_data.sort_values('timestamp').reset_index(drop=True)
+        log_message(f"Loaded {len(all_data)} existing candles", BOT_ID, 'INFO')
+
+        # Fetch every candle since the last stored one (paging back as far as needed)
+        last_ts = all_data['timestamp'].max()
+        log_message(f"Fetching gap candles since {last_ts}...", BOT_ID, 'INFO')
+        gap_df = fetch_ohlcv_since(POOL_ADDRESS, last_ts, TIMEZONE, BOT_ID)
+        if gap_df is None:
+            log_message("Could not fetch the gap since the last stored candle", BOT_ID, 'ERROR')
+            sys.exit(1)
+        gap_df = gap_df[gap_df['timestamp'] <= _finalized_cutoff()]
+        gap_df = backfill_missing_candles(
+            gap_df, prev_last_ts=last_ts,
+            prev_real_close=_last_real_close(all_data, len(all_data)))
+
+        new_start_idx = len(all_data)
+        if gap_df is not None and len(gap_df) > 0:
+            gap_df = gap_df.copy()
+            gap_df['bot_action'] = None
+            all_data = pd.concat([all_data, gap_df], ignore_index=True)
+            log_message(f"Fetched {len(gap_df)} gap candles", BOT_ID, 'INFO')
+        else:
+            log_message("No gap candles to fetch", BOT_ID, 'INFO')
+
+        log_message("Rebuilding the liquidity history...", BOT_ID, 'INFO')
+        engine = LiveFeatureEngine(all_data[['timestamp'] + OHLCV_COLS])
+        all_data = _store_liquidity(all_data, engine, 0)
+
+        if len(all_data) > new_start_idx:
+            gap_records = [_ohlcv_record(all_data.iloc[idx]) for idx in range(new_start_idx, len(all_data))]
+            insert_ohlcv_data(BOT_ID, gap_records)
+            log_message(f"Saved {len(gap_records)} gap candles to database", BOT_ID, 'INFO')
+
+    start_timestamp_unix = int(all_data['timestamp'].max().timestamp())
+    update_bot_runtime(BOT_ID, initializing=0)   # data collected; entering live loop
+    log_message(f"Starting live trading for {COIN} (mode: {TRADING_MODE})", BOT_ID, 'INFO')
+
+    # Init local trade-state vars
+    capital_sol = INITIAL_CAPITAL_SOL
+    position = 'closed'
+    shares_held = 0
+    entry_price_sol = None
+    entry_timestamp = None
+    trades_count = 0
+
+    # ================================================================
+    # MAIN LOOP
+    # ================================================================
+    try:
+        _prev_debug_mode = None  # baseline for the debug-toggle transition log
         while True:
             # 1. Read state from DB
-            b = get_bot(BOT_ID)
-            if not b or b['status'] not in ('running', 'paused'):
-                log_message(f"Bot {BOT_ID} status: {b['status'] if b else 'missing'}. Exiting.", BOT_ID, 'WARNING')
+            bot_state = get_bot(BOT_ID)
+            if not bot_state or bot_state['status'] not in ('running', 'paused'):
+                log_message(f"Bot {BOT_ID} status: {bot_state['status'] if bot_state else 'missing'}. Exiting.", BOT_ID, 'WARNING')
                 break
-            debug_mode = bool(b.get('debug_mode'))
-            if _prev_debug_mode is not None and debug_mode != _prev_debug_mode:
-                log_message(f"Advanced debugging {'enabled' if debug_mode else 'disabled'}", BOT_ID, 'INFO')
-            _prev_debug_mode = debug_mode
-            is_paused = (b['status'] == 'paused')
-            sol = get_latest_sol_price()
-            if sol:
-                bot.sol_usd = sol['price_usd']
 
-            # 2. Force sell immediate
+            # Per-bot advanced-debug toggle, re-read every iteration so the
+            # dashboard button takes effect within a minute without a restart.
+            # When off, the extra timing/diff values below are neither computed
+            # nor logged.
+            debug_mode = bool(bot_state.get('debug_mode'))
+
+            # Log only when the toggle actually changes. The "disabled" notice
+            # is intentionally NOT gated by debug_mode — it must print even
+            # though debug is now off. First iteration just sets the baseline.
+            if _prev_debug_mode is not None and debug_mode != _prev_debug_mode:
+                log_message(
+                    f"Advanced debugging {'enabled' if debug_mode else 'disabled'}",
+                    BOT_ID, 'INFO')
+            _prev_debug_mode = debug_mode
+
+            is_paused = (bot_state['status'] == 'paused')
+            position = bot_state['position']
+            capital_sol = bot_state['current_capital_sol'] or 0
+            shares_held = bot_state['shares_held'] or 0
+            entry_price_sol = bot_state['entry_price_sol']
+            trades_count = bot_state['trades_count'] or 0
+            entry_timestamp = bot_state.get('entry_timestamp')
+            entry_idx = get_entry_idx(all_data, entry_timestamp)
+
+            # Trade state
+            original_entry_price = bot_state.get('original_entry_price')
+            original_entry_timestamp = bot_state.get('original_entry_timestamp')
+            trade_phase = bot_state.get('trade_phase') or PHASE_NORMAL
+            below_floor_count = bot_state.get('below_floor_count') or 0
+            max_price_seen = bot_state.get('max_price_seen')
+            if max_price_seen is None:
+                max_price_seen = entry_price_sol if entry_price_sol else 0.0
+            n_reentries = bot_state.get('n_reentries', 0) or 0
+            last_sell_close = bot_state.get('last_sell_close')
+            last_sell_idx = bot_state.get('last_sell_idx')
+
+            # Update SOL price
+            sol_price_data = get_latest_sol_price()
+            if sol_price_data:
+                SOL_PRICE_USD = sol_price_data['price_usd']
+
+            # 2. Check force sell
             force_immediate, force_on_signal = check_force_sell_files(BOT_ID)
-            if force_immediate and bot.state.position == 'open':
+
+            if force_immediate and position == 'open':
                 log_message("FORCE SELL IMMEDIATE triggered", BOT_ID, 'WARNING')
-                cur = len(bot.all_data) - 1
-                bot.state.last_idx = max(bot.state.last_idx, cur)
-                bot.execute_sell(cur, "Force sell immediate")
+                current_idx = len(all_data) - 1
+                current_close = all_data.iloc[current_idx]['close']
+
+                # P&L always measured against original entry
+                use_entry = original_entry_price or entry_price_sol
+                exit_price = compute_exit_price(current_close, SLIPPAGE_PCT)
+
+                result = execute_sell(
+                    shares_held, exit_price, use_entry,
+                    INITIAL_CAPITAL_SOL, SLIPPAGE_PCT, TRADING_MODE, SWAP_CTX
+                )
+                if result.get('used_fallback'):
+                    log_message("Shadow sell used static fallback (no live quote)",
+                                BOT_ID, 'WARNING')
+
+                all_data.at[current_idx, 'bot_action'] = 'SELL'
+
+                # Persist the SELL marker to the OHLCV table immediately.
+                # The bulk OHLCV save at the bottom of the loop is skipped
+                # by the `continue` below, so without this the chart never
+                # sees the force-sell and no red triangle gets drawn.
+                # insert_ohlcv_data uses INSERT OR REPLACE on
+                # (bot_id, timestamp), so this cleanly overwrites the
+                # existing row for `current_idx`.
+                insert_ohlcv_data(BOT_ID, [_ohlcv_record(all_data.iloc[current_idx])])
+
+                open_trade = get_open_trade_for_bot(BOT_ID)
+                minutes_held = (current_idx - entry_idx) if entry_idx is not None else 0
+
+                if open_trade:
+                    update_trade_on_exit(
+                        open_trade['id'],
+                        str(all_data.iloc[current_idx]['timestamp']),
+                        result['fill_price_sol'],
+                        SOL_PRICE_USD,
+                        result['pnl_sol'], result['pnl_pct'],
+                        minutes_held, "Force sell immediate",
+                        result['fee_sol']
+                    )
+
+                deduct_trading_fee(result['fee_sol'])
+                log_message(f"FORCE SOLD at {format_price_si(result['fill_price_sol'])} SOL, P&L: {result['pnl_pct']*100:+.2f}%", BOT_ID, 'WARNING')
+
+                # capital_sol may be > 0 if liquidity-aware buy sizing left unused funds
+                new_capital_sol = ((capital_sol or 0) + result['proceeds_sol']
+                                   - (result.get('capital_fee_sol', 0) or 0))
+
+                update_bot_trading_state(BOT_ID,
+                    position='closed', shares_held=0, entry_price_sol=None,
+                    entry_timestamp=None, current_capital_sol=new_capital_sol,
+                    trades_count=trades_count + 1,
+                    original_entry_price=None, original_entry_timestamp=None,
+                    trade_phase=PHASE_NORMAL, below_floor_count=0, max_price_seen=None,
+                    n_reentries=0,
+                    last_sell_close=current_close,
+                    last_sell_idx=current_idx,
+                    latest_activation_pct=None
+                )
                 update_bot_runtime(BOT_ID, status='paused')
                 clear_force_sell_files(BOT_ID)
-                bot.snapshots(cur, cur)
+
+                # Write capital snapshot so wallet snapshot reads correct data
+                force_fees = get_bot_cumulative_fees_sol(BOT_ID)
+                force_ts = str(all_data.iloc[current_idx]['timestamp'])
+                insert_capital_snapshot(BOT_ID, force_ts, new_capital_sol, 0, force_fees)
+
+                write_wallet_snapshot()
                 continue
 
-            # 2.5 Paused: no data collection, keep the capital charts moving
+            # 2.5. If paused, skip data collection — only update capital snapshots
             if is_paused:
-                last = get_latest_ohlcv(BOT_ID, limit=1)
-                if last:
-                    price = last[0]['close']
-                    open_val = bot.shares * price if bot.state.position == 'open' else 0.0
-                    insert_capital_snapshot(BOT_ID, datetime.now().strftime('%Y-%m-%d %H:%M:00'),
-                                            bot.capital, open_val, get_bot_cumulative_fees_sol(BOT_ID))
+                # Write a fresh capital snapshot every loop iteration so the
+                # per-bot Capital Composition chart keeps advancing while
+                # paused — matches the wallet snapshot's behavior.
+                #
+                # Subtlety: the previous version reused last_ohlcv[0]['timestamp']
+                # here, which is frozen while paused (no new candles are being
+                # fetched). insert_capital_snapshot uses INSERT OR REPLACE on
+                # (bot_id, timestamp), so reusing the same timestamp just
+                # overwrote one row and the chart's right edge stayed pinned
+                # to the moment the bot was paused. Using the current
+                # wall-clock minute gives a new row every iteration.
+                last_ohlcv = get_latest_ohlcv(BOT_ID, limit=1)
+                if last_ohlcv:
+                    last_price = last_ohlcv[0]['close']
+                    cumulative_fees_sol = get_bot_cumulative_fees_sol(BOT_ID)
+                    timestamp_now = datetime.now().strftime('%Y-%m-%d %H:%M:00')
+
+                    if position == 'open' and shares_held > 0:
+                        open_position_sol = shares_held * last_price
+                        closed_capital = capital_sol or 0
+                    else:
+                        open_position_sol = 0
+                        closed_capital = capital_sol
+
+                    insert_capital_snapshot(BOT_ID, timestamp_now, closed_capital,
+                                           open_position_sol, cumulative_fees_sol)
+
+                # Keep the portfolio chart populated even when all bots are paused.
                 write_wallet_snapshot()
-                target = time.monotonic() + 30
-                while time.monotonic() < target:
-                    time.sleep(min(1.0, max(0.0, target - time.monotonic())))
-                    s = get_bot(BOT_ID)
-                    if not s or s['status'] != 'paused':
+
+                # Sleep while paused — but in <=1s chunks so a resume/stop
+                # is picked up within ~1s instead of up to 30s later. The
+                # capital snapshot above is still written once per 30s cycle;
+                # only the status polling is added. Any status change breaks
+                # out and the top of the loop handles it (running -> resume,
+                # stopped/missing -> clean exit).
+                pause_target = time.monotonic() + 30
+                while True:
+                    remaining = pause_target - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(1.0, remaining))
+                    pause_state = get_bot(BOT_ID)
+                    if not pause_state or pause_state['status'] != 'paused':
                         break
                 continue
 
-            # 3. Wait for the next candle (+ grace period), in <= 1 s chunks
-            now = datetime.now(tz=pd.Timestamp.now(tz=bot.tz).tz)
-            wait = (bot.grace - now.second) if now.second < bot.grace else (60 - now.second + bot.grace)
-            target = time.monotonic() + wait
-            interrupted = False
-            while time.monotonic() < target:
-                time.sleep(min(1.0, max(0.0, target - time.monotonic())))
-                s = get_bot(BOT_ID)
-                if s is not None:
-                    _wd = bool(s.get('debug_mode'))
-                    if _prev_debug_mode is not None and _wd != _prev_debug_mode:
-                        log_message(f"Advanced debugging {'enabled' if _wd else 'disabled'}", BOT_ID, 'INFO')
-                        _prev_debug_mode = _wd
-                if not s or s['status'] != 'running':
-                    interrupted = True
+            # 3. Wait for next candle
+            now = datetime.now(tz=pd.Timestamp.now(tz=TIMEZONE).tz)
+            seconds_into_minute = now.second
+            grace_period = GRACE_PERIOD_SECONDS
+            if seconds_into_minute < grace_period:
+                wait_seconds = grace_period - seconds_into_minute
+            else:
+                wait_seconds = 60 - seconds_into_minute + grace_period
+
+            # Sleep in <=1s chunks instead of one long block so a pause/stop
+            # issued from the dashboard is noticed within ~1s rather than only
+            # at the next iteration boundary. Total wait is unchanged (measured
+            # with the monotonic clock). If the status leaves 'running'
+            # mid-wait, abort and let the top of the loop re-evaluate (paused ->
+            # paused branch, stopped/missing -> clean exit).
+            wait_target = time.monotonic() + wait_seconds
+            wait_interrupted = False
+            while True:
+                remaining = wait_target - time.monotonic()
+                if remaining <= 0:
                     break
-            if interrupted:
+                time.sleep(min(1.0, remaining))
+                wait_state = get_bot(BOT_ID)
+                # Pick up a debug toggle within ~1s (not only at the top of the
+                # loop) so the enabled/disabled line appears promptly.
+                if wait_state is not None:
+                    _wd = bool(wait_state.get('debug_mode'))
+                    if _prev_debug_mode is not None and _wd != _prev_debug_mode:
+                        log_message(
+                            f"Advanced debugging {'enabled' if _wd else 'disabled'}",
+                            BOT_ID, 'INFO')
+                        _prev_debug_mode = _wd
+                if not wait_state or wait_state['status'] != 'running':
+                    wait_interrupted = True
+                    break
+            if wait_interrupted:
                 continue
 
-            # 4. Fetch (from ~2 min before the cursor, so the last stored minute
-            #    comes back too and can be checked for a late revision)
-            prev_last_ts = bot.all_data['timestamp'].iloc[-1]
-            t0 = time.monotonic()
-            new_df = fetch_ohlcv_from_timestamp(bot.pool, start_timestamp_unix - 120, bot.tz, BOT_ID,
-                                                debug=debug_mode)
-            api_secs = time.monotonic() - t0
+            # 4. Fetch new data. Fetch from ~2 min before the cursor so the most
+            #    recently stored minute returns too — we re-check it for a late
+            #    revision (step 4a) before accepting genuinely new minutes.
+            prev_last_ts = all_data['timestamp'].max()
+            # --- timing probe: measure the GeckoTerminal fetch (api=) and the
+            #     full request->log span (total=). A late 'Candles:' line with a
+            #     high api= is API latency; high (total - api) is local
+            #     processing. Uses the monotonic clock so it can't go negative.
+            _t_fetch_start = time.monotonic() if debug_mode else None
+            new_df = fetch_ohlcv_from_timestamp(
+                POOL_ADDRESS, start_timestamp_unix - 120, TIMEZONE, BOT_ID,
+                debug=debug_mode)
+            _api_secs = (time.monotonic() - _t_fetch_start) if debug_mode else None
             if new_df is None or len(new_df) == 0:
-                log_message(f"Fetch returned no data{f' (api={api_secs:.2f}s)' if debug_mode else ''} — "
-                            f"skipping this minute; will catch up on the next successful fetch",
-                            BOT_ID, 'WARNING')
+                # Fetch returned nothing. Without this line the minute is
+                # skipped silently (no 'Candles:' line) and the backlog is
+                # caught up on a later fetch — the invisible failure mode. A
+                # A high api here ~= a timeout/slow API; a low api ~= the API
+                # simply had no data. api= is shown only under debug.
+                _api_str = f" (api={_api_secs:.2f}s)" if debug_mode else ""
+                log_message(
+                    f"Fetch returned no data{_api_str} — skipping this minute; "
+                    f"will catch up on the next successful fetch",
+                    BOT_ID, 'WARNING')
                 continue
-            new_df = new_df[new_df['timestamp'] <= bot._cutoff()]
 
-            # 4a. Late revision of the previous minute
+            cutoff_time = datetime.now(tz=pd.Timestamp.now(tz=TIMEZONE).tz) - pd.Timedelta(minutes=FINALIZATION_LAG_MINUTES)
+            cutoff_time = cutoff_time.replace(second=0, microsecond=0)
+            new_df = new_df[new_df['timestamp'] <= cutoff_time]
+
+            # 4a. Re-check the previous minute for a late revision. The +5s read
+            #     can be provisional; by now (~60s later) the candle is settled.
+            #     If it changed, correct it and repair the affected features so a
+            #     stale value cannot leak into later rolling windows. Most minutes
+            #     are unchanged, so this is a cheap no-op the vast majority of
+            #     the time.
             recheck = new_df[new_df['timestamp'] == prev_last_ts]
             if len(recheck) == 1:
-                bot.all_data, corrected = _correct_last_minute_if_changed(bot.all_data, recheck.iloc[0])
+                refetched_row = recheck.iloc[0]
+                # Pre-revision OHLCV, captured only when debugging so we can
+                # report how far the late revision moved each field.
+                _pre = (all_data.iloc[-1][['open', 'high', 'low', 'close', 'volume']].copy()
+                        if debug_mode else None)
+                all_data, corrected = _correct_last_minute_if_changed(
+                    all_data, refetched_row, engine)
                 if corrected:
-                    insert_ohlcv_data(BOT_ID, [_ohlcv_record(bot.all_data, len(bot.all_data) - 1)])
-                    log_message(f"Corrected previous minute @ {str(prev_last_ts)[11:16]} (late revision)",
-                                BOT_ID, 'INFO')
+                    insert_ohlcv_data(BOT_ID, [_ohlcv_record(all_data.iloc[-1])])
+                    _ts_hm = (prev_last_ts.strftime('%H:%M')
+                              if hasattr(prev_last_ts, 'strftime') else str(prev_last_ts))
+                    _msg = f"Corrected previous minute @ {_ts_hm}"
+                    if debug_mode and _pre is not None:
+                        # All five fields (short labels), incl. unchanged (+0.00%).
+                        _labels = {'open': 'o', 'high': 'h', 'low': 'l',
+                                   'close': 'c', 'volume': 'v'}
+                        _parts = []
+                        for _c in ['open', 'high', 'low', 'close', 'volume']:
+                            _old = float(_pre[_c]); _new = float(refetched_row[_c])
+                            if abs(_old) > 1e-12:
+                                _parts.append(f"{_labels[_c]} {(_new - _old) / _old * 100:+.2f}%")
+                            elif _new == _old:            # 0 -> 0
+                                _parts.append(f"{_labels[_c]} +0.00%")
+                            else:                          # 0 -> nonzero (real change)
+                                _parts.append(f"{_labels[_c]} 0->{_new:g}")
+                        _msg += " | " + " ".join(_parts)
+                    log_message(_msg, BOT_ID, 'INFO')
 
-            # 4b. Genuinely new minutes, on a gap-free grid
-            first = len(bot.all_data)
-            bot.all_data, n_new = _append_minutes(bot.all_data, new_df[new_df['timestamp'] > prev_last_ts],
-                                                  bot.tz, BOT_ID)
-            if n_new == 0:
-                log_message(f"No new finalized candle past cutoff{f' (api={api_secs:.2f}s)' if debug_mode else ''}"
-                            f" — nothing to append this minute", BOT_ID, 'INFO')
+            # 4b. Keep only genuinely new minutes for the normal append path.
+            new_df = new_df[new_df['timestamp'] > prev_last_ts]
+
+            if len(new_df) == 0:
+                # Fetch succeeded, but nothing newer than the last stored minute
+                # cleared the finalization-lag cutoff, so there's no candle to
+                # append and no 'Candles:' line this iteration. Benign timing
+                # (distinct from the fetch failure above), logged so the skip
+                # is still visible. Any late-revision correction above was still
+                # applied. api= is shown only under debug.
+                _api_str = f" (api={_api_secs:.2f}s)" if debug_mode else ""
+                log_message(
+                    f"No new finalized candle past cutoff{_api_str} — "
+                    f"nothing to append this minute",
+                    BOT_ID, 'INFO')
                 continue
-            last = len(bot.all_data) - 1
 
-            # Re-check status right before acting (a pause / stop during the
-            # wait or fetch must not produce one more trade).
-            fresh = get_bot(BOT_ID)
-            allow_trading = bool(fresh and fresh['status'] == 'running')
+            # Fill the new minutes exactly as the data notebooks (continuous grid,
+            # zero-volume minutes flat at the last real close) and append them.
+            new_df = backfill_missing_candles(
+                new_df, prev_last_ts=prev_last_ts,
+                prev_real_close=_last_real_close(all_data, len(all_data)))
+            new_df = new_df.copy()
+            new_df['bot_action'] = None
+
+            new_start_idx = len(all_data)
+            num_new_rows = len(new_df)
+
+            all_data = pd.concat([all_data, new_df], ignore_index=True)
+            engine.sync(all_data)
+            all_data = _store_liquidity(all_data, engine, new_start_idx)
+
+            # Re-resolve entry_idx after concat
+            if entry_timestamp:
+                entry_idx = get_entry_idx(all_data, entry_timestamp)
+
+            # Re-check status right before acting on anything. The status read
+            # at the top of the loop is now stale by up to a full candle wait
+            # (~60s) plus the fetch time (which can include rate-limit backoff).
+            # A pause / stop-all / deallocate issued during that window must NOT
+            # produce one more trade. We still record OHLCV + predictions below
+            # so charts stay consistent; we only suppress trade actions.
+            fresh_state = get_bot(BOT_ID)
+            allow_trading = bool(fresh_state and fresh_state['status'] == 'running')
             if not allow_trading:
-                log_message(f"Status changed to '{fresh['status'] if fresh else 'missing'}' during the "
-                            f"candle wait/fetch — recording data but skipping trade actions this minute.",
-                            BOT_ID, 'INFO')
+                log_message(
+                    f"Status changed to "
+                    f"'{fresh_state['status'] if fresh_state else 'missing'}' during "
+                    f"the candle wait/fetch — recording data but skipping trade "
+                    f"actions this minute.",
+                    BOT_ID, 'INFO'
+                )
 
-            # 5. Scores + state machine
-            t1 = time.monotonic()
-            paused = bot.process_minutes(first, last, allow_trading, force_on_signal=force_on_signal)
-            proc_secs = time.monotonic() - t1
-            bot.persist()
-            if paused:
-                update_bot_runtime(BOT_ID, status='paused')
-                clear_force_sell_files(BOT_ID)
-                log_message(f"Bot {BOT_ID} paused after force sell on signal", BOT_ID, 'INFO')
+            # 5. Process each new candle
+            #
+            # Only the most recent finalized minute is "live". When a batch of
+            # backlogged candles arrives (slow historical fetch, API stall, or
+            # rate-limit backoff), the earlier candles are ingested for feature
+            # continuity and recorded, but trade decisions are made ONLY on the
+            # current minute. Acting on stale candles would simulate buys/sells
+            # several minutes in the past. In healthy operation num_new_rows == 1
+            # so last_new_idx == new_start_idx and this gate is a no-op.
+            last_new_idx = new_start_idx + num_new_rows - 1
+            combo = 0.0
 
-            # 6. Save OHLCV + snapshots
-            insert_ohlcv_data(BOT_ID, [_ohlcv_record(bot.all_data, i) for i in range(first, last + 1)])
-            start_timestamp_unix = int(bot.all_data['timestamp'].iloc[-1].timestamp())
-            bot.snapshots(first, last)
+            # V9 features for the new minutes (rows before START_IDX have none, as in the
+            # dataset) and the two models' scores, in one batch.
+            score_rows = [r for r in range(new_start_idx, new_start_idx + num_new_rows) if r >= START_IDX]
+            feature_df = (engine.features(all_data[['timestamp'] + OHLCV_COLS], score_rows)
+                          if score_rows else pd.DataFrame())
+            scores = scorer.score(feature_df) if len(feature_df) else None
 
-            # 7. Log line
-            st = bot.state
-            price = float(bot.all_data['close'].iloc[-1])
-            value = (bot.capital + (bot.shares * price if st.position == 'open' else 0)) * bot.sol_usd
-            pos = (f"open ({st.phase}, held {last - st.orig_entry_idx} min)" if st.position == 'open'
-                   else 'flat')
-            lt = bot.latest
-            dbg = f" | api={api_secs:.2f}s compute={proc_secs:.2f}s" if debug_mode else ""
+            for new_idx in range(new_start_idx, new_start_idx + num_new_rows):
+                if scores is None or new_idx not in feature_df.index:
+                    continue
+                k = feature_df.index.get_loc(new_idx)
+                features = feature_df.loc[new_idx].to_dict()
+                combo = float(scores['combo'][k])
+                raw_move = float(scores['raw_move'][k])
+                raw_dir = float(scores['raw_dir'][k])
+
+                insert_prediction(BOT_ID, str(all_data.iloc[new_idx]['timestamp']),
+                                  combo, raw_move, raw_dir, all_data.iloc[new_idx]['close'],
+                                  price_position_15m=features.get('price_position_15m'),
+                                  price_position_60m=features.get(PRICE_POSITION_60M_FEATURE))
+
+                current_close = all_data.iloc[new_idx]['close']
+
+                # ---- Trade-action gate ----------------------------------
+                # Skip all buy/sell/state-machine logic when either:
+                #   (Bug 1) this is not the current minute — a stale backlog
+                #           candle that must not be traded on; or
+                #   (Bug 2) the bot is no longer 'running' (paused/stopped/
+                #           deallocated during the candle wait or fetch).
+                # The prediction above is still recorded; only trading is
+                # suppressed.
+                if new_idx != last_new_idx or not allow_trading:
+                    continue
+
+                # ============================================================
+                # CLOSED — look for an entry candidate
+                # ============================================================
+                if position == 'closed':
+                    if (passes_entry_filters(combo, features)
+                            and passes_reentry_threshold(
+                                current_close, new_idx, last_sell_close, last_sell_idx)):
+
+                        # --- Liquidity-aware buy sizing ---
+                        liq_sol_per_1pct = all_data.iloc[new_idx].get('estimated_sol_1pct_impact')
+                        try:
+                            liq_sol_per_1pct = float(liq_sol_per_1pct)
+                        except (TypeError, ValueError):
+                            liq_sol_per_1pct = float('nan')
+
+                        if not np.isnan(liq_sol_per_1pct) and liq_sol_per_1pct > 0:
+                            max_sol_for_impact = liq_sol_per_1pct * (DESIRED_PRICE_IMPACT_PCT * 100.0)
+                            buy_amount_sol = min(capital_sol, max_sol_for_impact)
+                        else:
+                            buy_amount_sol = capital_sol
+
+                        if buy_amount_sol <= 0:
+                            log_message(
+                                f"Skipping buy at {format_price_si(current_close)}: "
+                                f"capped buy amount is {buy_amount_sol:.6f} SOL",
+                                BOT_ID, 'WARNING'
+                            )
+                            continue
+
+                        buy_result = execute_buy(
+                            buy_amount_sol, current_close,
+                            SLIPPAGE_PCT, TRADING_MODE, SWAP_CTX
+                        )
+                        if buy_result.get('used_fallback'):
+                            log_message("Shadow buy used static fallback (no live quote)",
+                                        BOT_ID, 'WARNING')
+
+                        # Network fee (shadow/live) is real SOL burned — deduct
+                        # it from capital on top of the amount spent on the swap.
+                        # Paper leaves capital_fee_sol unset (fee is implicit in
+                        # the fill price), so this is a no-op there.
+                        buy_fee = buy_result.get('capital_fee_sol', 0) or 0
+                        unused_capital = capital_sol - buy_amount_sol - buy_fee
+                        if unused_capital < 0:
+                            unused_capital = 0.0
+                        position = 'open'
+                        shares_held = buy_result['shares_received']
+                        entry_price_sol = buy_result['fill_price_sol']
+                        original_entry_price = entry_price_sol
+                        original_entry_timestamp = str(all_data.iloc[new_idx]['timestamp'])
+                        max_price_seen = current_close
+                        below_floor_count = 0
+                        trade_phase = PHASE_NORMAL
+                        n_reentries = 0
+                        entry_idx = new_idx
+                        entry_timestamp = original_entry_timestamp
+                        all_data.at[new_idx, 'bot_action'] = 'BUY'
+
+                        update_bot_trading_state(BOT_ID,
+                            position='open', shares_held=shares_held,
+                            entry_price_sol=entry_price_sol,
+                            entry_timestamp=entry_timestamp,
+                            current_capital_sol=unused_capital,
+                            original_entry_price=original_entry_price,
+                            original_entry_timestamp=original_entry_timestamp,
+                            trade_phase=PHASE_NORMAL, below_floor_count=0,
+                            max_price_seen=max_price_seen,
+                            n_reentries=0
+                        )
+
+                        insert_open_trade(
+                            BOT_ID, entry_timestamp, entry_price_sol,
+                            SOL_PRICE_USD, buy_amount_sol, buy_result['fee_sol']
+                        )
+                        deduct_trading_fee(buy_result['fee_sol'])
+                        capital_sol = unused_capital
+
+                        log_message(
+                            f"BUY at {format_price_si(entry_price_sol)} SOL, "
+                            f"Spent: {buy_amount_sol:.4f} SOL "
+                            f"(capital: {capital_sol + buy_amount_sol:.4f}, "
+                            f"liq cap: {('%.4f' % (liq_sol_per_1pct * DESIRED_PRICE_IMPACT_PCT * 100.0)) if not np.isnan(liq_sol_per_1pct) and liq_sol_per_1pct > 0 else 'n/a'}), "
+                            f"Combo: {combo:.4f} (move {raw_move:.4f} x dir {raw_dir:.4f})",
+                            BOT_ID, 'INFO'
+                        )
+
+                # ============================================================
+                # OPEN — drive the state machine
+                # ============================================================
+                elif position == 'open' and entry_idx is not None:
+                    minutes_held = new_idx - entry_idx
+
+                    # ------------------------------------------------
+                    # Path A: in a race phase, check re-entry candidate
+                    # ------------------------------------------------
+                    reentry_happened = False
+                    if trade_phase in (PHASE_STALE_RACE, PHASE_LOSS_FLOOR_RACE):
+                        if (passes_entry_filters(combo, features)
+                                and passes_reentry_threshold(
+                                    current_close, new_idx, last_sell_close, last_sell_idx)):
+                            # Re-enter: refresh segment, keep holding shares
+                            entry_price_sol = current_close  # no slippage — already holding
+                            entry_idx = new_idx
+                            entry_timestamp = str(all_data.iloc[new_idx]['timestamp'])
+                            max_price_seen = current_close
+                            below_floor_count = 0
+                            trade_phase = PHASE_NORMAL
+                            n_reentries += 1
+                            reentry_happened = True
+
+                            update_bot_trading_state(BOT_ID,
+                                entry_price_sol=entry_price_sol,
+                                entry_timestamp=entry_timestamp,
+                                trade_phase=PHASE_NORMAL, below_floor_count=0,
+                                max_price_seen=max_price_seen,
+                                n_reentries=n_reentries
+                            )
+
+                            log_message(
+                                f"RE-ENTRY #{n_reentries} at {format_price_si(current_close)} SOL, "
+                                f"Combo: {combo:.4f}",
+                                BOT_ID, 'INFO'
+                            )
+
+                    # ------------------------------------------------
+                    # Path B: state-machine step (sell / phase transition / hold)
+                    # ------------------------------------------------
+                    if not reentry_happened:
+                        step = step_open_position(
+                            current_close, entry_price_sol, minutes_held,
+                            max_price_seen, below_floor_count, trade_phase
+                        )
+                        max_price_seen = step['max_price_seen']
+                        below_floor_count = step['below_floor_count']
+
+                        # Persist running state every minute (telemetry)
+                        update_bot_trading_state(BOT_ID,
+                            max_price_seen=max_price_seen,
+                            below_floor_count=below_floor_count,
+                            latest_activation_pct=step.get('effective_activation_pct')
+                        )
+
+                        action = step['action']
+
+                        # ---- SELL (activation) ----
+                        if action == 'sell':
+                            reason = step['reason']
+                            if force_on_signal:
+                                reason = "Force sell on signal"
+
+                            # P&L measured against the original (first-leg) entry
+                            use_entry = original_entry_price or entry_price_sol
+                            exit_price = compute_exit_price(current_close, SLIPPAGE_PCT)
+
+                            sell_result = execute_sell(
+                                shares_held, exit_price, use_entry,
+                                INITIAL_CAPITAL_SOL, SLIPPAGE_PCT, TRADING_MODE, SWAP_CTX
+                            )
+                            if sell_result.get('used_fallback'):
+                                log_message("Shadow sell used static fallback (no live quote)",
+                                            BOT_ID, 'WARNING')
+
+                            capital_sol = (capital_sol + sell_result['proceeds_sol']
+                                           - (sell_result.get('capital_fee_sol', 0) or 0))
+                            all_data.at[new_idx, 'bot_action'] = 'SELL'
+
+                            open_trade = get_open_trade_for_bot(BOT_ID)
+                            total_minutes = new_idx - get_entry_idx(all_data, original_entry_timestamp) \
+                                if original_entry_timestamp else minutes_held
+                            if open_trade:
+                                update_trade_on_exit(
+                                    open_trade['id'],
+                                    str(all_data.iloc[new_idx]['timestamp']),
+                                    sell_result['fill_price_sol'],
+                                    SOL_PRICE_USD,
+                                    sell_result['pnl_sol'], sell_result['pnl_pct'],
+                                    total_minutes, reason, sell_result['fee_sol']
+                                )
+
+                            deduct_trading_fee(sell_result['fee_sol'])
+                            log_message(
+                                f"SELL {COIN} at {format_price_si(sell_result['fill_price_sol'])} SOL, "
+                                f"P&L: {sell_result['pnl_pct']*100:+.2f}% ({sell_result['pnl_sol']:+.4f} SOL), "
+                                f"Fee: {sell_result['fee_sol']:.6f} SOL, "
+                                f"Re-entries: {n_reentries}, Reason: {reason}",
+                                BOT_ID, 'INFO'
+                            )
+
+                            position = 'closed'
+                            shares_held = 0
+                            trades_count += 1
+                            entry_timestamp = None
+                            should_stop = force_on_signal
+
+                            sell_state = dict(
+                                position='closed', shares_held=0, entry_price_sol=None,
+                                entry_timestamp=None, current_capital_sol=capital_sol,
+                                trades_count=trades_count,
+                                original_entry_price=None, original_entry_timestamp=None,
+                                trade_phase=PHASE_NORMAL, below_floor_count=0,
+                                max_price_seen=None,
+                                n_reentries=0,
+                                last_sell_close=current_close,
+                                last_sell_idx=new_idx,
+                                latest_activation_pct=None
+                            )
+
+                            if should_stop:
+                                update_bot_trading_state(BOT_ID, **sell_state)
+                                update_bot_runtime(BOT_ID, status='paused')
+                                clear_force_sell_files(BOT_ID)
+                                is_paused = True
+                                log_message(f"Bot {BOT_ID} paused after force sell on signal", BOT_ID, 'INFO')
+                            else:
+                                update_bot_trading_state(BOT_ID, **sell_state)
+
+                            # Update local state for re-entry filter
+                            last_sell_close = current_close
+                            last_sell_idx = new_idx
+                            # reset segment-level state
+                            max_price_seen = None
+                            below_floor_count = 0
+                            trade_phase = PHASE_NORMAL
+
+                        # ---- Enter STALE RACE ----
+                        elif action == 'enter_stale_race':
+                            trade_phase = PHASE_STALE_RACE
+                            update_bot_trading_state(BOT_ID,
+                                trade_phase=PHASE_STALE_RACE,
+                                below_floor_count=0
+                            )
+                            log_message(
+                                f"STALE_RACE entered after {minutes_held} min: "
+                                f"scanning for re-entry, activation still armed.",
+                                BOT_ID, 'INFO'
+                            )
+
+                        # ---- Enter LOSS-FLOOR RACE ----
+                        elif action == 'enter_loss_floor_race':
+                            trade_phase = PHASE_LOSS_FLOOR_RACE
+                            update_bot_trading_state(BOT_ID,
+                                trade_phase=PHASE_LOSS_FLOOR_RACE,
+                                below_floor_count=below_floor_count
+                            )
+                            log_message(
+                                f"LOSS_FLOOR_RACE entered: {step['reason']}",
+                                BOT_ID, 'WARNING'
+                            )
+
+                        # ---- Recover from LF race back to NORMAL ----
+                        elif action == 'recover_loss_floor':
+                            trade_phase = PHASE_NORMAL
+                            below_floor_count = 0
+                            update_bot_trading_state(BOT_ID,
+                                trade_phase=PHASE_NORMAL,
+                                below_floor_count=0
+                            )
+                            log_message(
+                                f"LOSS_FLOOR recovered: resuming NORMAL phase.",
+                                BOT_ID, 'INFO'
+                            )
+
+                        # action == 'hold' is a no-op beyond the state persist above
+
+            # 6. Save OHLCV and capital snapshots
+            new_records = []
+            for idx in range(new_start_idx, new_start_idx + num_new_rows):
+                row = all_data.iloc[idx]
+                new_records.append(_ohlcv_record(row))
+            insert_ohlcv_data(BOT_ID, new_records)
+
+            start_timestamp_unix = int(all_data['timestamp'].max().timestamp())
+
+            cumulative_fees_sol = get_bot_cumulative_fees_sol(BOT_ID)
+            for idx in range(new_start_idx, new_start_idx + num_new_rows):
+                timestamp_str = str(all_data.iloc[idx]['timestamp'])
+                current_token_price = all_data.iloc[idx]['close']
+
+                if position == 'open' and shares_held > 0:
+                    open_position_sol = shares_held * current_token_price
+                    closed_capital = capital_sol or 0
+                else:
+                    open_position_sol = 0
+                    closed_capital = capital_sol
+
+                insert_capital_snapshot(BOT_ID, timestamp_str, closed_capital,
+                                       open_position_sol, cumulative_fees_sol)
+
+            # 7. Update bot state (top-level summary; segment-level state was
+            # persisted minute-by-minute above)
+            update_bot_trading_state(BOT_ID,
+                current_capital_sol=capital_sol, position=position,
+                shares_held=shares_held,
+                entry_price_sol=entry_price_sol if position == 'open' else None,
+                trades_count=trades_count
+            )
+
+            # 8. Wallet capital snapshot — write every iteration so the portfolio
+            # chart (driven by wallet_capital_history) has the same per-minute
+            # cadence as the per-bot capital_history table.
+            write_wallet_snapshot()
+
+            current_value = capital_sol * SOL_PRICE_USD if position == 'closed' \
+                else (shares_held * all_data.iloc[-1]['close'] + (capital_sol or 0)) * SOL_PRICE_USD
             if debug_mode:
-                liq = bot.all_data['estimated_sol_1pct_impact'].iloc[-1]
-                if liq is not None and not pd.isna(liq) and liq > 0:
-                    log_message(f"Liquidity: est={liq:.4f} SOL/1% impact | cap={liq * bot.max_impact * 100:.4f} "
-                                f"SOL @ {bot.max_impact * 100:.3f}%", BOT_ID, 'INFO')
-            log_message(f"Candles: {len(bot.all_data)} | Capital: {bot.capital:.4f} SOL (${value:.2f}) | "
-                        f"Trades: {bot.trades_count} | Position: {pos} | combo {lt.get('combo', float('nan')):.3f} "
-                        f"dir {lt.get('dir', float('nan')):.3f} move {lt.get('move', float('nan')):.3f}{dbg}",
+                _liq_est = all_data.iloc[-1].get('estimated_sol_1pct_impact')
+                if (_liq_est is not None
+                        and not (isinstance(_liq_est, float) and np.isnan(_liq_est))
+                        and _liq_est > 0):
+                    _liq_cap = _liq_est * DESIRED_PRICE_IMPACT_PCT * 100.0
+                    _, _liq_age, _liq_std, _liq_conf = engine.liquidity_state_at(len(all_data) - 1)
+                    log_message(
+                        f"Liquidity: est={_liq_est:.4f} SOL/1% impact | "
+                        f"cap={_liq_cap:.4f} SOL @ {DESIRED_PRICE_IMPACT_PCT * 100:.2f}% | "
+                        f"age={_liq_age:.0f} min, dispersion={_liq_std:.1f}%, confidence={_liq_conf:.2f}",
                         BOT_ID, 'INFO')
+                else:
+                    log_message(
+                        "Liquidity: est=n/a (fewer than 5 usable candles so far)",
+                        BOT_ID, 'INFO')
+            _dbg_timing = (
+                f" | api={_api_secs:.2f}s total={time.monotonic() - _t_fetch_start:.2f}s"
+                if debug_mode else ""
+            )
+            log_message(
+                f"Candles: {len(all_data)} | Capital: {capital_sol:.4f} SOL "
+                f"(${current_value:.2f}) | Trades: {trades_count} | "
+                f"Combo: {combo:.4f}{_dbg_timing}",
+                BOT_ID, 'INFO'
+            )
 
     except KeyboardInterrupt:
         log_message(f"Bot {BOT_ID} interrupted", BOT_ID, 'WARNING')
@@ -802,13 +1144,23 @@ def main():
         import traceback
         log_message(f"Traceback: {traceback.format_exc()}", BOT_ID, 'ERROR')
     finally:
+        # Final state update
         update_bot_runtime(BOT_ID, status='stopped', pid=None, stopped_at=datetime.now())
-        if bot.state is not None:
-            if bot.state.position == 'open':
-                log_message(f"Bot {BOT_ID} stopped with an OPEN position ({bot.shares} shares). The "
-                            f"saved state machine resumes it on the next start; force-sell to close it.",
-                            BOT_ID, 'WARNING')
-            bot.persist()
+
+        if position == 'open':
+            log_message(
+                f'CRITICAL: Bot {BOT_ID} stopped with OPEN position. '
+                f'Shares: {shares_held}, Entry: {entry_price_sol} SOL. '
+                f'Manual intervention required.',
+                BOT_ID, 'ERROR'
+            )
+
+        update_bot_trading_state(BOT_ID,
+            current_capital_sol=capital_sol, position=position,
+            shares_held=shares_held,
+            entry_price_sol=entry_price_sol if position == 'open' else None,
+            trades_count=trades_count
+        )
         log_message(f"Bot {BOT_ID} stopped", BOT_ID, 'INFO')
 
 

@@ -1,79 +1,48 @@
 """
-features.py — the V9 features, live.
+Feature computation — the V9 features of Dataset_creationV9.ipynb, for the live bot.
 
-This file IS the feature code of development_notebooks/Dataset_creationV9.ipynb
-(cells: config constants, liquidity, pump sets, per-coin features, the 22 window
-features), copied verbatim, followed by a short live section at the bottom.
-Every value equals the dataset value the models were trained on.
+The feature code below is the notebook's own (compute_liquidity_robust_causal,
+compute_pump_set, window_features and the per-minute feature loop of
+compute_coin_features_v9), with only these changes for live use:
+  * features are computed for the requested rows (normally the newest minute)
+    instead of START_IDX .. n - 30, and no labels are computed;
+  * the hour features use UTC hours, exactly as the dataset (its loader parses
+    the timestamps as UTC and never converts them);
+  * the liquidity estimate can be supplied by CausalLiquidity, an incremental
+    version of compute_liquidity_robust_causal with identical output, so a new
+    minute does not recompute the whole coin.
 
-Changes to the research code, all marked "LIVE OPTIMISATION":
-  * an optional row range (compute_coin_features_v9(row_from=...),
-    window_features(row_from=...), live_feature_frame(last_n=...)) so the bot
-    computes only the newest minutes; with default arguments the output is
-    identical to the notebook;
-  * the 22 window features are merged in live_feature_frame() rather than inside
-    compute_coin_features_v9(), and days_since_first (computed by the V8 loop)
-    is dropped there, as in the dataset;
-  * the notebook's import-time print is removed.
-The live section adds compute_live_features(), an exact incremental cache for
-the liquidity estimate, and helper columns for the dashboard.
+Every feature at row i depends only on rows <= i (the notebook's leakage test),
+so computing on the coin's full history up to now gives the dataset's values.
+That requires the full history from the coin's FIRST candle: minutes since
+launch, the launch features, the all-time high and the liquidity floor are all
+anchored to row 0.
 
-After a change to the feature code in Dataset_creationV9, copy the cells here
-again; the code must stay identical apart from the LIVE OPTIMISATION lines.
-
-Live use:  live_feature_frame(ohlcv_df)  ->  one row per minute (from START_IDX on) with
-every feature the models need, computed from data up to that minute only.
-  * ohlcv_df: columns timestamp, open, high, low, close, volume; one row per minute
-    (forward-filled, as data_collection does), oldest first, prices in SOL per token.
-  * Timestamps are converted to UTC — the dataset's hour features are UTC hours.
-  * The dataset leaves out the last MAX_FORWARD rows of a coin (its labels need the
-    future); live, the wrapper pads MAX_FORWARD flat candles after the last real
-    minute, computes, and drops them. The features are causal (V9 leakage test), so
-    the real rows are unaffected by the padding.
+Public API (used by bot_loop.py and scoring.py):
+  LiveFeatureEngine(ohlcv_df)        incremental liquidity state for one coin
+    .sync(ohlcv_df)                  process rows appended since the last call
+    .revise(ohlcv_df, first_changed) re-process from a row whose OHLCV changed
+    .features(ohlcv_df, rows)        feature DataFrame (index = row positions)
+    .liquidity_at(idx)               estimated_sol_1pct_impact at a row
+  compute_live_features(df, rows, liquidity)   the feature function itself
 """
-import pandas as pd
+
 import numpy as np
-import json
-import re
-import time
-import gc
-from pathlib import Path
-from typing import Tuple, List
-from multiprocessing import Pool, cpu_count
-from functools import partial
+import pandas as pd
 from scipy.stats import skew, kurtosis
-from numba import njit
 import warnings
+
 warnings.simplefilter('ignore', pd.errors.PerformanceWarning)
 
-# ── WINDOW CONVENTION ───────────────────────────────────────────────────────
-ALLOWED_WINDOWS_MIN = {'1m': 1, '2m': 2, '3m': 3, '5m': 5, '10m': 10, '15m': 15, '30m': 30, '1h': 60,
-                       '2h': 120, '4h': 240, '8h': 480, '12h': 720, '24h': 1440, '36h': 2160,
-                       '48h': 2880, '3d': 4320, '7d': 10080}
-
-# ── ROWS AND LABELS ─────────────────────────────────────────────────────────
-START_IDX = 120               # first row per coin (as V8)
-MAX_FORWARD = 30              # rows end 30 minutes before the coin's end (as V8)
-MOVE_LABEL = ('label_10pct_30m', 0.10, 30)           # model 1 (unchanged)
-FP_LABEL = ('label_fpclass_15pct_2h', 0.15, 0.15, 120)  # model 2: 2 = up first, 1 = down first, 0 = neither
-META_COL = 'label_meta_minutes_to_end'                # minutes from the row to the coin's last minute
-LABEL_COLS = [MOVE_LABEL[0], FP_LABEL[0], META_COL]
-# (the label_ prefix keeps both out of every feature selector; training uses
-#  META_COL >= 240 to reproduce the rows all experiments trained on)
-
-# ── PUMP DEFINITIONS (pump = close >= +rise above the low of the last window) ─
-PUMP_SETS = [{'suffix': '', 'rise': 0.10, 'window': 30},          # model 1 (as V8)
-             {'suffix': '_p15_2h', 'rise': 0.15, 'window': 120}]  # model 2
-
-# ── LIQUIDITY (current method; look-ahead fixed) ────────────────────────────
-LIQ_STATS_REFRESH_MIN = 15    # the volume floor + median/MAD clip are recomputed every 15 min
-                              # from all data up to that minute (causal)
+# ── V9 settings (Dataset_creationV9 config cell) ─────────────────────────────
+START_IDX = 120               # first row per coin with features (as the dataset)
+PUMP_SETS = [{'suffix': '', 'rise': 0.10, 'window': 30},          # move model
+             {'suffix': '_p15_2h', 'rise': 0.15, 'window': 120}]  # direction model
+LIQ_STATS_REFRESH_MIN = 15    # liquidity floor + median/MAD clip recomputed every 15 min (causal)
 
 
-
-# ============================ LIQUIDITY (V9 cell) ============================
 # ============================================================================
-# LIQUIDITY — estimated_sol_1pct_impact, without look-ahead
+# LIQUIDITY — estimated_sol_1pct_impact without look-ahead (Dataset_creationV9, verbatim)
 # ============================================================================
 def compute_liquidity_robust_causal(
     open_arr: np.ndarray,
@@ -246,15 +215,203 @@ def compute_liquidity_robust_causal(
 
     return liq_est, liq_age_arr, liq_std_arr, liq_conf_arr
 
-# ============================ PUMP SETS (V9 cell) ============================
+
+class CausalLiquidity:
+    """
+    Incremental compute_liquidity_robust_causal: feeding rows one at a time (or in any
+    chunks) gives the same four arrays as the batch function on the same data.
+
+    It keeps the batch function's state between calls: the volume floor and the
+    median/MAD clip of the current 15-minute block, the pool of valid log-impacts and the
+    exponentially weighted sums. A snapshot of that state is kept at the start of each
+    recent block so a revised minute can be re-processed (revise) without starting over.
+    """
+
+    def __init__(self, *, tau=1440.0, min_samples=5, min_body_ret=1e-4, max_body_ret=0.50,
+                 vol_floor_q=0.05, mad_clip=5.0, clip_sol_1pct=(1e-6, 1e12),
+                 refresh=LIQ_STATS_REFRESH_MIN, keep_blocks=96):
+        self.tau, self.min_samples = tau, min_samples
+        self.min_body_ret, self.max_body_ret = min_body_ret, max_body_ret
+        self.vol_floor_q, self.mad_clip, self.clip_sol_1pct = vol_floor_q, mad_clip, clip_sol_1pct
+        self.refresh, self.keep_blocks = int(refresh), int(keep_blocks)
+        self.eps = 1e-12
+        self.decay = np.exp(-1.0 / tau)
+        self.log001 = np.log(0.01)
+        self.n = 0
+        self._out = np.full((4, 1024), np.nan)      # liq_est, liq_age, liq_std, liq_conf
+        self._pool = np.full(1024, np.nan)           # raw log-impact of the valid bars so far
+        self._snapshots = {}                         # block start -> state before that row
+        self._reset_state()
+
+    # ---- state ------------------------------------------------------------
+    def _reset_state(self):
+        self.n = 0
+        self.n_pool = 0
+        self.S = 0.0
+        self.W = 0.0
+        self.Sq = 0.0
+        self.last_valid = -1
+        self.n_usable = 0
+        self.warmed = False
+        self.last_ll = np.nan
+        self.last_std = np.nan
+        self.vfloor = 0.0
+        self.clip_on = False
+        self.med = np.nan
+        self.mad = np.nan
+        self._snapshots = {}
+
+    _STATE = ('n_pool', 'S', 'W', 'Sq', 'last_valid', 'n_usable', 'warmed', 'last_ll', 'last_std')
+
+    def _snapshot(self, j):
+        self._snapshots[j] = {k: getattr(self, k) for k in self._STATE}
+        if len(self._snapshots) > self.keep_blocks:
+            for key in sorted(self._snapshots)[:-self.keep_blocks]:
+                del self._snapshots[key]
+
+    def rewind_to(self, idx):
+        """Forget rows >= idx (rounded down to their block start). Returns False when that
+        block's snapshot is no longer kept (the caller then rebuilds from scratch)."""
+        idx = max(0, min(int(idx), self.n))
+        if idx >= self.n:
+            return True
+        b = (idx // self.refresh) * self.refresh
+        snap = self._snapshots.get(b)
+        if snap is None:
+            return False
+        for k, v in snap.items():
+            setattr(self, k, v)
+        self._out[:, b:self.n] = np.nan
+        self.n = b
+        for key in [k for k in self._snapshots if k > b]:
+            del self._snapshots[key]
+        del self._snapshots[b]          # re-taken when row b is processed again
+        return True
+
+    def _grow(self, n_rows):
+        if n_rows > self._out.shape[1]:
+            cap = max(n_rows, 2 * self._out.shape[1])
+            out = np.full((4, cap), np.nan)
+            out[:, :self.n] = self._out[:, :self.n]
+            self._out = out
+
+    def _pool_add(self, x):
+        if self.n_pool >= len(self._pool):
+            pool = np.full(2 * len(self._pool), np.nan)
+            pool[:self.n_pool] = self._pool[:self.n_pool]
+            self._pool = pool
+        self._pool[self.n_pool] = x
+        self.n_pool += 1
+
+    # ---- processing --------------------------------------------------------
+    def update(self, open_arr, high_arr, low_arr, close_arr, volume_arr):
+        """Process every row of the given (full-history) arrays not processed yet."""
+        open_arr = np.asarray(open_arr, dtype=np.float64)
+        high_arr = np.asarray(high_arr, dtype=np.float64)
+        low_arr = np.asarray(low_arr, dtype=np.float64)
+        close_arr = np.asarray(close_arr, dtype=np.float64)
+        volume_arr = np.asarray(volume_arr, dtype=np.float64)
+        n = len(close_arr)
+        if n <= self.n:
+            return
+        self._grow(n)
+        eps, refresh = self.eps, self.refresh
+        start = self.n
+
+        # per-bar quantities, exactly as the batch function (element-wise, so any slice
+        # gives the same values as the full array)
+        sl = slice(start, n)
+        o, h, l, c, v = open_arr[sl], high_arr[sl], low_arr[sl], close_arr[sl], volume_arr[sl]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            body_ret = np.where(o > eps, (c - o) / o, 0.0)
+        abs_body = np.abs(body_ret)
+        rng = h - l
+        with np.errstate(divide="ignore", invalid="ignore"):
+            eff = np.where(rng > eps, np.abs(c - o) / rng, 0.0)
+        eff = np.clip(eff, 0.0, 1.0)
+        move = np.clip(abs_body, self.min_body_ret, self.max_body_ret)
+
+        # walk the rows in pieces that never cross a block boundary
+        j = start
+        while j < n:
+            block_start = (j // refresh) * refresh
+            end = min(n, block_start + refresh)
+            k0, k1 = j - start, end - start
+            if j == block_start:
+                self._snapshot(j)
+                # volume floor from the coin's positive volume up to and including bar j
+                pv = volume_arr[:j + 1]
+                pv = pv[pv > 0]
+                vfloor = np.quantile(pv, self.vol_floor_q) if pv.size else 0.0
+                if pv.size and vfloor >= np.max(pv):
+                    vfloor = 0.0
+                self.vfloor = vfloor
+            v_blk = (v[k0:k1] > max(self.vfloor, eps)) & (abs_body[k0:k1] >= self.min_body_ret) & (rng[k0:k1] > eps)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                lam_blk = np.where(v_blk, move[k0:k1] / v[k0:k1], np.nan)
+                ll_blk = np.log(lam_blk, where=v_blk, out=np.full(k1 - k0, np.nan))
+            v_blk &= np.isfinite(ll_blk)
+            raw = ll_blk.copy()
+            first_add = 0
+            if j == block_start:
+                # the clip for this block uses the valid bars up to and including bar j
+                if v_blk[0]:
+                    self._pool_add(ll_blk[0])
+                first_add = 1
+                self.clip_on = bool(self.n_pool)
+                if self.clip_on:
+                    p = self._pool[:self.n_pool]
+                    self.med = np.median(p)
+                    self.mad = np.median(np.abs(p - self.med)) * 1.4826 + eps
+            if self.clip_on:
+                ll_blk = np.clip(ll_blk, self.med - self.mad_clip * self.mad, self.med + self.mad_clip * self.mad)
+            log_lam = np.where(v_blk, ll_blk, np.nan)
+            # the rest of the block's valid bars join the pool for later blocks
+            for x in raw[first_add:][v_blk[first_add:]]:
+                self._pool_add(x)
+
+            # EW geometric aggregation + warm-up gate + forward-fill
+            for kk in range(k1 - k0):
+                i = j + kk
+                self.S *= self.decay
+                self.W *= self.decay
+                self.Sq *= self.decay
+                fresh = bool(v_blk[kk] and np.isfinite(log_lam[kk]))
+                if fresh:
+                    w = eff[k0 + kk] + 1e-3
+                    x = log_lam[kk]
+                    self.S += w * x
+                    self.W += w
+                    self.Sq += w * x * x
+                    self.last_valid = i
+                    self.n_usable += 1
+                if not self.warmed:
+                    if self.n_usable >= self.min_samples:
+                        self.warmed = True
+                    else:
+                        continue
+                if fresh:
+                    self.last_ll = self.S / self.W
+                    if self.W > eps:
+                        var = max(self.Sq / self.W - self.last_ll * self.last_ll, 0.0)
+                        self.last_std = (np.exp(np.sqrt(var)) - 1.0) * 100.0
+                sol_1pct = np.exp(-self.last_ll + self.log001)
+                self._out[0, i] = float(np.clip(sol_1pct, *self.clip_sol_1pct))
+                self._out[1, i] = (i - self.last_valid) if self.last_valid >= 0 else np.nan
+                self._out[2, i] = self.last_std
+                self._out[3, i] = self.W / (self.W + self.min_samples)
+            j = end
+        self.n = n
+
+    def arrays(self):
+        """(liq_est, liq_age, liq_std, liq_conf) for the processed rows — the batch order."""
+        o = self._out[:, :self.n]
+        return o[0], o[1], o[2], o[3]
+
+
 # ============================================================================
-# PUMP FEATURES (vectorised) + FIRST-PASSAGE LABEL
+# PUMP FEATURES — once per pump definition in PUMP_SETS (Dataset_creationV9, verbatim)
 # ============================================================================
-# The pump-dependent features, computed the same way as V8's feature loop
-# (this engine reproduced V8 exactly in the earlier experiments), with the
-# windows snapped:  3h -> 4h (pump window, densities, clustering, time-weighted
-# density, excess buying pressure),  6h -> 8h (pump velocity); the 30-day
-# features are gone. Run once per pump definition in PUMP_SETS.
 PUMP_FEATURES = [
     'cooling_off_indicator', 'excess_buying_pressure_4h', 'cumulative_positive_since_last_pump',
     'buying_pressure_accumulation_rate', 'recent_pump_rate_7d', 'pump_density_1h', 'pump_density_2h',
@@ -400,64 +557,77 @@ def compute_pump_set(close_s, close_arr, rows, ctx, rise, window):
     return f
 
 
-@njit
-def first_passage_classes(close, rows, up, down, window, last_ok):
-    """2 = +up reached first, 1 = -down first, 0 = neither within window,
-    -1 = undefined (row after last_ok or non-positive price)."""
-    out = np.full(len(rows), -1, dtype=np.int8)
-    for k in range(len(rows)):
-        i = rows[k]
-        if i > last_ok:
-            continue
-        c0 = close[i]
-        if not (c0 > 0):
-            continue
-        cls = 0
-        for j in range(i + 1, i + window + 1):
-            pct = (close[j] - c0) / c0
-            if pct >= up:
-                cls = 2
-                break
-            if pct <= -down:
-                cls = 1
-                break
-        out[k] = cls
-    return out
-
-
-# LIVE OPTIMISATION: the notebook's import-time "Pump engine ready" print is removed
-# (it would be written to every bot process's stdout pipe)
-
-# ============================ PER-COIN FEATURES (V9 cell) ============================
 # ============================================================================
-# PER-COIN FEATURES (V8's feature code with the V9 changes) + BUILD HELPERS
+# THE 22 WINDOW FEATURES (Dataset_creationV9)
 # ============================================================================
-# The non-pump features are V8's own per-minute loop, edited only where V9
-# changes something (each edit is marked "V9"). The pump-dependent features
-# come from compute_pump_set, once per pump definition. Rows, the move label
-# and the loading steps are exactly as in V8.
+def window_features(df, rows):
+    """The 22 window features (Dataset_creationV9), for the given rows. Causal: rolling
+    statistics use windows ending at the previous minute; returns compare the current close
+    with the close w minutes earlier (the first close early on)."""
+    n = len(df)
+    rows = np.asarray(rows, dtype=np.int64)
+    prev = rows - 1
+    c = df['close'].to_numpy(np.float64)
+    hi_s, lo_s, c_s = df['high'], df['low'], df['close']
+    v_s = df['volume'].astype(np.float64)
+    ret_s = c_s.pct_change(fill_method=None)
+    W_ = {'1m': 1, '2m': 2, '10m': 10, '2h': 120, '4h': 240, '8h': 480, '12h': 720, '24h': 1440, '48h': 2880, '3d': 4320}
+    f = {}
+    for w in ('1m', '2m', '10m', '2h', '4h', '12h', '48h', '3d'):
+        past = np.roll(c, W_[w])
+        past[:W_[w]] = c[0]
+        f[f'return_{w}'] = np.where(past > 1e-10, (c - past) / past, 0.0)[rows]
+    for w in ('4h', '8h', '3d'):
+        f[f'volatility_{w}'] = ret_s.rolling(W_[w], min_periods=W_[w]).std().to_numpy()[prev]
+    cur = c[rows]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        for w in ('4h', '24h'):
+            hh = hi_s.rolling(W_[w], min_periods=1).max().to_numpy()[prev]
+            ll = lo_s.rolling(W_[w], min_periods=1).min().to_numpy()[prev]
+            rng = hh - ll
+            rel = np.where(cur > 1e-10, rng / cur, 0.0)
+            f[f'price_position_{w}'] = np.where(rel >= 0.01, np.clip((cur - ll) / rng, 0, 1), 0.0)
+        for w in ('4h', '3d'):
+            pk = c_s.rolling(W_[w], min_periods=1).max().to_numpy()[prev]
+            f[f'drawdown_from_{w}_peak'] = np.where(pk > 1e-10, (cur - pk) / pk, 0.0)
+        ath = np.maximum.accumulate(c)[prev]
+        f['drawdown_from_ath'] = np.where(ath > 1e-10, (cur - ath) / ath, 0.0)
+        idx = np.arange(n)
+        ath_idx = np.maximum.accumulate(np.where(c >= np.maximum.accumulate(c), idx, 0))
+        f['minutes_since_ath'] = (rows - ath_idx[prev]).astype(np.float64)
+        for w in ('4h', '24h'):
+            lo = c_s.rolling(W_[w], min_periods=1).min().to_numpy()[prev]
+            f[f'drawup_from_{w}_low'] = np.where(lo > 1e-10, (cur - lo) / lo, 0.0)
+        vm = {k: v_s.rolling(k, min_periods=1).mean().to_numpy()[prev] for k in (60, 240, 1440, 4320)}
+        f['volume_mean_ratio_1h_24h'] = np.where(vm[1440] > 1e-10, vm[60] / vm[1440], np.nan)
+        f['volume_mean_ratio_4h_3d'] = np.where(vm[4320] > 1e-10, vm[240] / vm[4320], np.nan)
+        f['volume_mean_ratio_24h_3d'] = np.where(vm[4320] > 1e-10, vm[1440] / vm[4320], np.nan)
+    return f, rows
 
 
-def load_ohlcv(csv_file):
-    """V8's loading steps."""
-    df = pd.read_csv(csv_file)
-    if 'timestamp' not in df.columns:
-        if df.index.name == 'timestamp':
-            df = df.reset_index()
-        else:
-            df.rename(columns={df.columns[0]: 'timestamp'}, inplace=True)
-    df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', utc=True, errors='coerce')
-    df = df[df['timestamp'].notna()]
-    return df.sort_values('timestamp').reset_index(drop=True)
+WINDOW_FEATURES = ['return_1m', 'return_2m', 'return_10m', 'return_2h', 'return_4h', 'return_12h', 'return_48h',
+                   'return_3d', 'volatility_4h', 'volatility_8h', 'volatility_3d', 'price_position_4h',
+                   'price_position_24h', 'drawdown_from_4h_peak', 'drawdown_from_3d_peak', 'drawdown_from_ath',
+                   'minutes_since_ath', 'drawup_from_4h_low', 'drawup_from_24h_low', 'volume_mean_ratio_1h_24h',
+                   'volume_mean_ratio_4h_3d', 'volume_mean_ratio_24h_3d']
 
 
-def compute_coin_features_v9(coin_name, df, row_from=None):
-    """All V9 features + labels for one coin's loaded OHLCV. None if unusable.
+# ============================================================================
+# ALL FEATURES FOR GIVEN ROWS (Dataset_creationV9's compute_coin_features_v9 without
+# the labels and the 30-minute end cut)
+# ============================================================================
+def compute_live_features(df, rows=None, liquidity=None):
+    """All V9 model features for the given rows of one coin's OHLCV.
 
-    LIVE OPTIMISATION (the only change to the research code in this function):
-    row_from = first row to emit. Every precomputed array still covers the
-    whole history; only the per-row loop and the pump-set rows start later, so
-    each emitted row is identical to the full run. None = all rows (original)."""
+    df: the coin's FULL 1-minute OHLCV from its first candle (continuous grid, zero-volume
+        minutes flat at the last real close), columns timestamp/open/high/low/close/volume.
+    rows: positions in df to compute (default: the last row). Rows before START_IDX are
+        skipped, as in the dataset.
+    liquidity: optional (liq_est, liq_age, liq_std, liq_conf) arrays covering every row of
+        df, e.g. from CausalLiquidity; computed here when not given.
+    Returns a DataFrame indexed by row position (empty if no row qualifies), or None if a
+    required column is missing. No labels.
+    """
     df = df.copy().reset_index(drop=True)
     required_cols = ['open', 'high', 'low', 'close', 'volume']
     if not all(col in df.columns for col in required_cols):
@@ -482,7 +652,9 @@ def compute_coin_features_v9(coin_name, df, row_from=None):
     volume_arr = df['volume'].values.astype(np.float64)
     returns_arr = df['returns'].values.astype(np.float64)
     timestamps = df['timestamp'].values
-    ts_hours = df['timestamp'].dt.hour.values
+    # The dataset parses timestamps as UTC (load_ohlcv: utc=True, no conversion), so the hour
+    # features use UTC hours whatever timezone the live data is kept in.
+    ts_hours = pd.to_datetime(df['timestamp'], utc=True).dt.hour.values
 
     # ==================================================================
     # PRE-COMPUTE ROLLING STATISTICS AS ARRAYS
@@ -570,7 +742,6 @@ def compute_coin_features_v9(coin_name, df, row_from=None):
     # ==================================================================
     coin_first_ts = df['timestamp'].min()
     _minutes_since_launch = (df['timestamp'] - coin_first_ts).dt.total_seconds().values / 60.0
-    _days_since_first = _minutes_since_launch / 1440.0
 
     # Launch features (constant values computed once). V9: 6h -> 8h; each is
     # available from its own horizon on (gates in the loop).
@@ -621,9 +792,13 @@ def compute_coin_features_v9(coin_name, df, row_from=None):
     # ==================================================================
     # PRE-COMPUTE LIQUIDITY (robust, regime-aware 1% price-impact estimator)
     # ==================================================================
-    liq_est, liq_age_arr, liq_std_arr, liq_conf_arr = compute_liquidity_robust_causal(
-        open_arr, high_arr, low_arr, close_arr, volume_arr, n, refresh=LIQ_STATS_REFRESH_MIN
-    )
+    if liquidity is None:
+        liquidity = compute_liquidity_robust_causal(
+            open_arr, high_arr, low_arr, close_arr, volume_arr, n, refresh=LIQ_STATS_REFRESH_MIN
+        )
+    liq_est, liq_age_arr, liq_std_arr, liq_conf_arr = (np.asarray(a, dtype=np.float64)[:n] for a in liquidity)
+    if len(liq_est) != n:
+        raise ValueError(f"liquidity arrays cover {len(liq_est)} rows, the OHLCV has {n}")
 
     # hist_vol_dict for volatility_percentile — values at [idx] (not [idx-1])
     hist_vol_dict = {}
@@ -634,47 +809,34 @@ def compute_coin_features_v9(coin_name, df, row_from=None):
                 hist_vol_dict[idx] = v
 
     # ------------------------------------------------------------------
-    # SAMPLE RANGE (as V8: rows START_IDX .. n - MAX_FORWARD - 1)
+    # ROWS (live: the requested rows; the dataset starts every coin at START_IDX)
     # ------------------------------------------------------------------
-    start_idx = START_IDX
-    max_forward = MAX_FORWARD
-    end_idx = n - max_forward
-    if start_idx >= end_idx:
-        return None
-    loop_start = start_idx if row_from is None else max(start_idx, int(row_from))   # LIVE OPTIMISATION
-    if loop_start >= end_idx:                                                        # LIVE OPTIMISATION
-        return None
+    if rows is None:
+        rows = [n - 1]
+    rows = np.asarray([int(r) for r in np.atleast_1d(rows) if START_IDX <= int(r) < n], dtype=np.int64)
+    if len(rows) == 0:
+        return pd.DataFrame()
 
     # ------------------------------------------------------------------
     # FEATURE LOOP (optimized: reads from pre-computed arrays)
     # ------------------------------------------------------------------
     samples = []
 
-    for i in range(loop_start, end_idx):                                             # LIVE OPTIMISATION
+    for i in (int(r) for r in rows):
         current_close = close_arr[i]
         current_volume = volume_arr[i]
         current_ts = pd.Timestamp(timestamps[i])
         hour = ts_hours[i]
 
-        sample = {'coin_id': coin_name, 'timestamp': current_ts}
-
-        # --- Labels ---
-        future_closes = close_arr[i + 1:i + 1 + max_forward]
-        if len(future_closes) > 0:
-            cummax = np.maximum.accumulate(future_closes)
-            _lbl, x, y = MOVE_LABEL
-            pct_gain = (cummax[y - 1] - current_close) / current_close if y <= len(cummax) else np.nan
-            sample[_lbl] = 1 if not np.isnan(pct_gain) and pct_gain >= x else 0
+        sample = {'timestamp': current_ts}
 
         features = {}
         minutes_since_first = _minutes_since_launch[i]
-        days_since_first = _days_since_first[i]
 
         # ==============================================================
         # LIFECYCLE & TEMPORAL
         # ==============================================================
         features['minutes_since_launch'] = minutes_since_first
-        features['days_since_first'] = days_since_first
         features['hour_sin'] = np.sin(2 * np.pi * hour / 24)
         features['hour_cos'] = np.cos(2 * np.pi * hour / 24)
 
@@ -1168,8 +1330,7 @@ def compute_coin_features_v9(coin_name, df, row_from=None):
         sample.update(features)
         samples.append(sample)
 
-    out = pd.DataFrame(samples)
-    rows = np.arange(loop_start, end_idx, dtype=np.int64)                            # LIVE OPTIMISATION
+    out = pd.DataFrame(samples, index=rows)
     prev = rows - 1
     ctx = {'vol_120': _vol_120[prev], 'vol_30': _vol_30[prev], 'vol_mean_30': _vol_mean_30[prev],
            'cur_liq': liq_est[rows], 'liq_age': liq_age_arr[rows], 'msf': _minutes_since_launch[rows],
@@ -1178,342 +1339,56 @@ def compute_coin_features_v9(coin_name, df, row_from=None):
         f = compute_pump_set(df['close'], close_arr, rows, ctx, ps['rise'], ps['window'])
         for k in PUMP_FEATURES:
             out[k + ps['suffix']] = f[k]
-    _lbl, up, dn, w = FP_LABEL
-    cls = first_passage_classes(close_arr, rows, up, dn, w, n - 1 - w)
-    out[_lbl] = np.where(cls >= 0, cls.astype(np.float64), np.nan)
-    out[META_COL] = (n - 1 - rows).astype(np.float64)
-    labels = [MOVE_LABEL[0], FP_LABEL[0], META_COL]
-    feats = [c for c in out.columns if c not in ['coin_id', 'timestamp'] + labels]
-    return out[['coin_id', 'timestamp'] + labels + feats]
-
-
-def coin_id_of(csv_file):
-    return Path(csv_file).stem.replace("_ohlcv", "")
-
-
-
-# ============================ 22 WINDOW FEATURES (feature_windows) ============================
-def window_features(df, row_from=None):
-    """The 22 window features of feature_windows (V9 conventions), rows START_IDX .. n - MAX_FORWARD - 1.
-    LIVE OPTIMISATION: row_from = first row to emit (None = all, the original)."""
-    n = len(df)
-    rows = np.arange(START_IDX if row_from is None else max(START_IDX, int(row_from)), n - MAX_FORWARD)
-    prev = rows - 1
-    c = df['close'].to_numpy(np.float64)
-    hi_s, lo_s, c_s = df['high'], df['low'], df['close']
-    v_s = df['volume'].astype(np.float64)
-    ret_s = c_s.pct_change(fill_method=None)
-    W_ = {'1m': 1, '2m': 2, '10m': 10, '2h': 120, '4h': 240, '8h': 480, '12h': 720, '24h': 1440, '48h': 2880, '3d': 4320}
-    f = {}
-    for w in ('1m', '2m', '10m', '2h', '4h', '12h', '48h', '3d'):
-        past = np.roll(c, W_[w])
-        past[:W_[w]] = c[0]
-        f[f'return_{w}'] = np.where(past > 1e-10, (c - past) / past, 0.0)[rows]
-    for w in ('4h', '8h', '3d'):
-        f[f'volatility_{w}'] = ret_s.rolling(W_[w], min_periods=W_[w]).std().to_numpy()[prev]
-    cur = c[rows]
-    with np.errstate(divide='ignore', invalid='ignore'):
-        for w in ('4h', '24h'):
-            hh = hi_s.rolling(W_[w], min_periods=1).max().to_numpy()[prev]
-            ll = lo_s.rolling(W_[w], min_periods=1).min().to_numpy()[prev]
-            rng = hh - ll
-            rel = np.where(cur > 1e-10, rng / cur, 0.0)
-            f[f'price_position_{w}'] = np.where(rel >= 0.01, np.clip((cur - ll) / rng, 0, 1), 0.0)
-        for w in ('4h', '3d'):
-            pk = c_s.rolling(W_[w], min_periods=1).max().to_numpy()[prev]
-            f[f'drawdown_from_{w}_peak'] = np.where(pk > 1e-10, (cur - pk) / pk, 0.0)
-        ath = np.maximum.accumulate(c)[prev]
-        f['drawdown_from_ath'] = np.where(ath > 1e-10, (cur - ath) / ath, 0.0)
-        idx = np.arange(n)
-        ath_idx = np.maximum.accumulate(np.where(c >= np.maximum.accumulate(c), idx, 0))
-        f['minutes_since_ath'] = (rows - ath_idx[prev]).astype(np.float64)
-        for w in ('4h', '24h'):
-            lo = c_s.rolling(W_[w], min_periods=1).min().to_numpy()[prev]
-            f[f'drawup_from_{w}_low'] = np.where(lo > 1e-10, (cur - lo) / lo, 0.0)
-        vm = {k: v_s.rolling(k, min_periods=1).mean().to_numpy()[prev] for k in (60, 240, 1440, 4320)}
-        f['volume_mean_ratio_1h_24h'] = np.where(vm[1440] > 1e-10, vm[60] / vm[1440], np.nan)
-        f['volume_mean_ratio_4h_3d'] = np.where(vm[4320] > 1e-10, vm[240] / vm[4320], np.nan)
-        f['volume_mean_ratio_24h_3d'] = np.where(vm[4320] > 1e-10, vm[1440] / vm[4320], np.nan)
-    return f, rows
-
-
-WINDOW_FEATURES = ['return_1m', 'return_2m', 'return_10m', 'return_2h', 'return_4h', 'return_12h', 'return_48h',
-                   'return_3d', 'volatility_4h', 'volatility_8h', 'volatility_3d', 'price_position_4h',
-                   'price_position_24h', 'drawdown_from_4h_peak', 'drawdown_from_3d_peak', 'drawdown_from_ath',
-                   'minutes_since_ath', 'drawup_from_4h_low', 'drawup_from_24h_low', 'volume_mean_ratio_1h_24h',
-                   'volume_mean_ratio_4h_3d', 'volume_mean_ratio_24h_3d']
-
-
-DROP_FEATURES = ['days_since_first']          # exact duplicate of minutes_since_launch (removed)
-_LABEL_COLS = LABEL_COLS
-
-
-def live_feature_frame(ohlcv_df, coin_name='live', last_n=None):
-    """Every model feature for each minute from START_IDX to the LAST real minute.
-    LIVE OPTIMISATION: last_n = only the last n real minutes (None = all, the
-    original). Identical values per row."""
-    df = ohlcv_df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].copy()
-    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-    df = df.sort_values('timestamp').reset_index(drop=True)
-    n_real = len(df)
-    if n_real <= START_IDX:
-        return None
-    last = df.iloc[-1]
-    pad = pd.DataFrame({'timestamp': [last['timestamp'] + pd.Timedelta(minutes=k) for k in range(1, MAX_FORWARD + 1)],
-                        'open': last['close'], 'high': last['close'], 'low': last['close'],
-                        'close': last['close'], 'volume': 0.0})
-    padded = pd.concat([df, pad], ignore_index=True)
-    row_from = None if last_n is None else max(0, n_real - int(last_n))              # LIVE OPTIMISATION
-    feats = compute_coin_features_v9(coin_name, padded, row_from=row_from)
-    if feats is None or len(feats) == 0:
-        return None
-    w, rows = window_features(padded, row_from=row_from)
+    wf, wrows = window_features(df, rows)                             # the 22 window features
     for k in WINDOW_FEATURES:
-        feats[k] = w[k]
-    feats = feats.drop(columns=[c for c in feats.columns if c.startswith('label') or c in DROP_FEATURES])
-    return feats.reset_index(drop=True)
+        out[k] = wf[k]
+    return out
 
 
-# ############################################################################
-# LIVE SECTION (not part of the research code)
-# ############################################################################
-# The bot keeps the coin's FULL forward-filled minute history in `all_data`
-# (oldest first, from the coin's first OHLCV minute) and asks for the features of
-# the newest minutes only. Minute index = row index in all_data = minutes since
-# the coin's first minute. The first START_IDX (120) minutes have no features.
-import hashlib
-
-OHLCV_COLS = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+# ============================================================================
+# LIVE FEATURE ENGINE — one per coin (bot)
+# ============================================================================
+_OHLCV = ['open', 'high', 'low', 'close', 'volume']
 
 
-def compute_live_features(all_data, last_n=1):
-    """Every model feature for the last `last_n` minutes of all_data.
-
-    Returns a DataFrame with a 'minute_idx' column (row index in all_data) and
-    every feature column, or None if no requested minute has features yet.
-    Values are identical to the research dataset (Dataset_creationV9).
+class LiveFeatureEngine:
     """
-    df = all_data[OHLCV_COLS]
-    _LIQ.safe_rows = len(df) - 1          # the newest minute may still be revised
-    try:
-        feats = live_feature_frame(df, 'live', last_n=int(last_n))
-    finally:
-        _LIQ.safe_rows = None
+    Holds the incremental liquidity state for one coin and computes the V9 features of
+    any row from the coin's full OHLCV frame (kept by the caller, rows = positions from the
+    coin's first candle).
+    """
 
-    if feats is None or len(feats) == 0:
-        return None
-    n = len(df)
-    feats['minute_idx'] = np.arange(n - len(feats), n, dtype=np.int64)
-    # Alignment guard: the frame must end at the last real minute.
-    # (the research code emits naive UTC timestamps)
-    t_last = pd.Timestamp(feats['timestamp'].iloc[-1])
-    t_last = t_last.tz_localize('UTC') if t_last.tzinfo is None else t_last.tz_convert('UTC')
-    t_data = pd.Timestamp(df['timestamp'].iloc[-1])
-    t_data = t_data.tz_localize('UTC') if t_data.tzinfo is None else t_data.tz_convert('UTC')
-    if t_last != t_data:
-        raise RuntimeError(f"feature frame misaligned: {t_last} vs {t_data}")
-    return feats
+    def __init__(self, ohlcv_df):
+        self.liq = CausalLiquidity()
+        self.sync(ohlcv_df)
 
+    def _arrays(self, ohlcv_df):
+        return [ohlcv_df[c].to_numpy(dtype=np.float64) for c in _OHLCV]
 
-def display_columns(all_data):
-    """The per-minute helper columns stored in ohlcv_data for the dashboard
-    (returns, vol_120, completed_pump, and the causal 1% price-impact estimate
-    with its age / dispersion), over the whole history. Not model inputs."""
-    close = all_data['close'].to_numpy(np.float64)
-    n = len(close)
-    s = pd.Series(close)
-    returns = s.pct_change(fill_method=None)
-    vol_120 = returns.rolling(120, min_periods=120).std()
-    rise, window = PUMP_SETS[0]['rise'], PUMP_SETS[0]['window']
-    rmin = s.rolling(window + 1, min_periods=window + 1).min()
-    pump = ((s - rmin) / rmin >= rise).astype(int).to_numpy().copy()
-    pump[:window] = 0
-    est, age, std, _conf = compute_liquidity_robust_causal(
-        all_data['open'].to_numpy(np.float64), all_data['high'].to_numpy(np.float64),
-        all_data['low'].to_numpy(np.float64), close, all_data['volume'].to_numpy(np.float64),
-        n, refresh=LIQ_STATS_REFRESH_MIN)
-    return pd.DataFrame({'returns': returns.to_numpy(), 'vol_120': vol_120.to_numpy(),
-                         'completed_pump': pump, 'estimated_sol_1pct_impact': est,
-                         'liquidity_sample_age_minutes': age, 'liquidity_estimate_std_pct': std},
-                        index=all_data.index)
+    def sync(self, ohlcv_df):
+        """Process the rows appended to ohlcv_df since the last call."""
+        self.liq.update(*self._arrays(ohlcv_df))
 
+    def revise(self, ohlcv_df, first_changed):
+        """Rows >= first_changed have new OHLCV values: re-process from there."""
+        if not self.liq.rewind_to(first_changed):
+            self.liq = CausalLiquidity()
+        self.liq.update(*self._arrays(ohlcv_df))
 
-def check_minute_grid(all_data):
-    """True if all_data is one row per minute with no gaps or duplicates."""
-    ts = pd.to_datetime(all_data['timestamp'], utc=True)
-    if len(ts) < 2:
-        return True
-    d = ts.diff().iloc[1:]
-    return bool((d == pd.Timedelta(minutes=1)).all())
+    def liquidity_at(self, idx):
+        idx = int(idx)
+        return float(self.liq._out[0, idx]) if 0 <= idx < self.liq.n else float('nan')
 
+    def liquidity_state_at(self, idx):
+        """(estimate, minutes since last usable bar, dispersion %, confidence) at a row."""
+        idx = int(idx)
+        if not 0 <= idx < self.liq.n:
+            return (float('nan'),) * 4
+        return tuple(float(x) for x in self.liq._out[:, idx])
 
-# ============================================================================
-# INCREMENTAL LIQUIDITY (exact; replaces a full recompute every minute)
-# ============================================================================
-# compute_liquidity_robust_causal is causal and block-structured: block r (15
-# rows) depends only on rows <= its end, and the exponential-weighting pass is a
-# running state. Re-running it over the whole history every minute costs
-# O(n^2 / 15) (a quantile + a median per block over everything so far): ~3 s at
-# 30 days. This cache keeps the finished blocks and the running state at the
-# last block boundary of FINAL data (all rows but the newest, which GeckoTerminal
-# may still revise) and continues from there with the very same operations, so
-# the result is bit-identical to the original function.
-# The cached prefix is verified by a hash of its OHLCV bytes on every call; any
-# change -> full recompute.
-import hashlib
-
-_original_liquidity = compute_liquidity_robust_causal       # the research function, unchanged
-_DEFAULTS = dict(tau=1440.0, min_samples=5, min_body_ret=1e-4, max_body_ret=0.50,
-                 vol_floor_q=0.05, mad_clip=5.0, clip_sol_1pct=(1e-6, 1e12),
-                 refresh=LIQ_STATS_REFRESH_MIN)
-
-
-class _LiquidityCache:
-    def __init__(self):
-        self.safe_rows = None      # rows < safe_rows are final (set per call by compute_live_features)
-        self.state = None          # dict: L, digest, arrays and running state at row L
-
-    @staticmethod
-    def _digest(arrs, L):
-        h = hashlib.blake2b(digest_size=16)
-        for a in arrs:
-            h.update(np.ascontiguousarray(a[:L]).tobytes())
-        return h.digest()
-
-
-_LIQ = _LiquidityCache()
-
-
-def _liquidity_incremental(open_arr, high_arr, low_arr, close_arr, volume_arr, n, **kw):
-    params = dict(_DEFAULTS, **kw)
-    if params != _DEFAULTS or _LIQ.safe_rows is None:
-        return _original_liquidity(open_arr, high_arr, low_arr, close_arr, volume_arr, n, **kw)
-    tau, min_samples = params['tau'], params['min_samples']
-    min_body_ret, max_body_ret = params['min_body_ret'], params['max_body_ret']
-    vol_floor_q, mad_clip, clip_sol_1pct, refresh = (params['vol_floor_q'], params['mad_clip'],
-                                                     params['clip_sol_1pct'], params['refresh'])
-    eps = 1e-12
-    arrs = (open_arr, high_arr, low_arr, close_arr, volume_arr)
-    L_new = (min(_LIQ.safe_rows, n) // refresh) * refresh
-
-    # ---- resume point ----
-    st = _LIQ.state
-    if st is not None and st['L'] <= n and _LIQ._digest(arrs, st['L']) == st['digest']:
-        L0 = st['L']
-    else:
-        st, L0 = None, 0
-
-    # ---- 1. per-bar samples (elementwise; identical to the original) ----
-    with np.errstate(divide="ignore", invalid="ignore"):
-        body_ret = np.where(open_arr > eps, (close_arr - open_arr) / open_arr, 0.0)
-    abs_body = np.abs(body_ret)
-    rng = high_arr - low_arr
-    with np.errstate(divide="ignore", invalid="ignore"):
-        eff = np.where(rng > eps, np.abs(close_arr - open_arr) / rng, 0.0)
-    eff = np.clip(eff, 0.0, 1.0)
-    move = np.clip(abs_body, min_body_ret, max_body_ret)
-
-    valid = np.zeros(n, dtype=bool)
-    log_lam = np.full(n, np.nan)
-    pool = np.full(n, np.nan)
-    if st is not None:
-        valid[:L0] = st['valid']
-        log_lam[:L0] = st['log_lam']
-        pool[:st['n_pool']] = st['pool']
-        n_pool = st['n_pool']
-    else:
-        n_pool = 0
-    snap_blocks = None
-    for r in range(L0, n, refresh):          # same block loop as the original, from L0
-        if r == L_new and L_new > L0:
-            snap_blocks = (valid[:r].copy(), log_lam[:r].copy(), pool[:n_pool].copy(), n_pool)
-        pv = volume_arr[:r + 1]
-        pv = pv[pv > 0]
-        vfloor = np.quantile(pv, vol_floor_q) if pv.size else 0.0
-        if pv.size and vfloor >= np.max(pv):
-            vfloor = 0.0
-        end = min(n, r + refresh)
-        blk = slice(r, end)
-        v_blk = (volume_arr[blk] > max(vfloor, eps)) & (abs_body[blk] >= min_body_ret) & (rng[blk] > eps)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            lam_blk = np.where(v_blk, move[blk] / volume_arr[blk], np.nan)
-            ll_blk = np.log(lam_blk, where=v_blk, out=np.full(end - r, np.nan))
-        v_blk &= np.isfinite(ll_blk)
-        if v_blk[0]:
-            pool[n_pool] = ll_blk[0]
-            n_pool += 1
-        raw = ll_blk.copy()
-        if n_pool:
-            p = pool[:n_pool]
-            med = np.median(p)
-            mad = np.median(np.abs(p - med)) * 1.4826 + eps
-            ll_blk = np.clip(ll_blk, med - mad_clip * mad, med + mad_clip * mad)
-        valid[blk] = v_blk
-        log_lam[blk] = np.where(v_blk, ll_blk, np.nan)
-        add = raw[1:][v_blk[1:]]
-        pool[n_pool:n_pool + len(add)] = add
-        n_pool += len(add)
-
-    # ---- 3. EW geometric aggregation (same loop, from the saved state) ----
-    log001 = np.log(0.01)
-    decay = np.exp(-1.0 / tau)
-    liq_est = np.full(n, np.nan)
-    liq_age_arr = np.full(n, np.nan)
-    liq_std_arr = np.full(n, np.nan)
-    liq_conf_arr = np.full(n, np.nan)
-    if st is not None:
-        S, W, Sq = st['S'], st['W'], st['Sq']
-        last_valid, n_usable, warmed = st['last_valid'], st['n_usable'], st['warmed']
-        last_ll, last_std = st['last_ll'], st['last_std']
-        liq_est[:L0], liq_age_arr[:L0] = st['liq_est'], st['liq_age']
-        liq_std_arr[:L0], liq_conf_arr[:L0] = st['liq_std'], st['liq_conf']
-    else:
-        S = W = Sq = 0.0
-        last_valid, n_usable, warmed = -1, 0, False
-        last_ll = last_std = np.nan
-    snap_ew = None
-    for i in range(L0, n):
-        if i == L_new and L_new > L0:
-            snap_ew = (S, W, Sq, last_valid, n_usable, warmed, last_ll, last_std)
-        S *= decay
-        W *= decay
-        Sq *= decay
-        fresh = bool(valid[i] and np.isfinite(log_lam[i]))
-        if fresh:
-            w = eff[i] + 1e-3
-            x = log_lam[i]
-            S += w * x
-            W += w
-            Sq += w * x * x
-            last_valid = i
-            n_usable += 1
-        if not warmed:
-            if n_usable >= min_samples:
-                warmed = True
-            else:
-                continue
-        if fresh:
-            last_ll = S / W
-            if W > eps:
-                var = max(Sq / W - last_ll * last_ll, 0.0)
-                last_std = (np.exp(np.sqrt(var)) - 1.0) * 100.0
-        sol_1pct = np.exp(-last_ll + log001)
-        liq_est[i] = float(np.clip(sol_1pct, *clip_sol_1pct))
-        liq_std_arr[i] = last_std
-        liq_age_arr[i] = (i - last_valid) if last_valid >= 0 else np.nan
-        liq_conf_arr[i] = W / (W + min_samples)
-
-    if snap_blocks is not None and snap_ew is not None:
-        v, ll, pl, npool = snap_blocks
-        S_, W_, Sq_, lv, nu, wm, lll, lst = snap_ew
-        _LIQ.state = {'L': L_new, 'digest': _LIQ._digest(arrs, L_new), 'valid': v, 'log_lam': ll,
-                      'pool': pl, 'n_pool': npool, 'S': S_, 'W': W_, 'Sq': Sq_, 'last_valid': lv,
-                      'n_usable': nu, 'warmed': wm, 'last_ll': lll, 'last_std': lst,
-                      'liq_est': liq_est[:L_new].copy(), 'liq_age': liq_age_arr[:L_new].copy(),
-                      'liq_std': liq_std_arr[:L_new].copy(), 'liq_conf': liq_conf_arr[:L_new].copy()}
-    return liq_est, liq_age_arr, liq_std_arr, liq_conf_arr
-
-
-# compute_coin_features_v9 looks the function up by name at call time, so this
-# swaps in the exact incremental version without editing the research code.
-compute_liquidity_robust_causal = _liquidity_incremental
+    def features(self, ohlcv_df, rows=None):
+        """V9 features for the given rows (default: the last row) as a DataFrame indexed by
+        row position. Rows before START_IDX are left out."""
+        if self.liq.n != len(ohlcv_df):
+            self.sync(ohlcv_df)
+        return compute_live_features(ohlcv_df, rows=rows, liquidity=self.liq.arrays())

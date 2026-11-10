@@ -10,14 +10,14 @@ import os
 import signal
 import time
 from datetime import datetime
-import json
+from strategy import effective_reentry_threshold, strategy_params
 from database import (
     get_bot, get_all_bots_from_db, get_all_trades,
-    get_latest_ohlcv, log_message, get_strategy_config,
+    get_latest_ohlcv, log_message,
     update_bot_runtime,
     initialize_bot_in_db, deallocate_from_bot,
     get_wallet_status, get_db_connection,
-    insert_wallet_capital_snapshot
+    insert_wallet_capital_snapshot, get_global_settings
 )
 
 
@@ -84,25 +84,30 @@ class BotManager:
         if not bot:
             return {'error': 'Bot not found'}
 
-        # Fetch latest prediction data for buy readiness display
+        # Fetch the latest model scores for the buy-readiness display
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            # Latest scores: prediction = combo percentile (buy gate),
-            # dir_pct / move_pct = the direction / move percentiles,
-            # price_position_60m = the feature price_position_1h.
             cursor.execute('''
-                SELECT prediction, price, dir_pct, move_pct, price_position_15m, price_position_60m
+                SELECT combo, raw_move, raw_dir, price, price_position_15m, price_position_60m
                 FROM predictions
                 WHERE bot_id = ?
                 ORDER BY timestamp DESC LIMIT 1
             ''', (bot_id,))
             row = cursor.fetchone()
-            bot['latest_prediction'] = row['prediction'] if row else None
-            bot['latest_close'] = row['price'] if row else None
-            bot['latest_dir_pct'] = row['dir_pct'] if row else None
-            bot['latest_move_pct'] = row['move_pct'] if row else None
-            bot['latest_pp_15m'] = row['price_position_15m'] if row else None
-            bot['latest_pp_60m'] = row['price_position_60m'] if row else None
+            if row:
+                bot['latest_combo'] = row['combo']
+                bot['latest_raw_move'] = row['raw_move']
+                bot['latest_raw_dir'] = row['raw_dir']
+                bot['latest_close'] = row['price']
+                bot['latest_pp_15m'] = row['price_position_15m']
+                bot['latest_pp_60m'] = row['price_position_60m']
+            else:
+                bot['latest_combo'] = None
+                bot['latest_raw_move'] = None
+                bot['latest_raw_dir'] = None
+                bot['latest_close'] = None
+                bot['latest_pp_15m'] = None
+                bot['latest_pp_60m'] = None
 
             # Fetch latest capital snapshot for Capital Overview chart
             cursor.execute('''
@@ -151,41 +156,28 @@ class BotManager:
             bot['winning_trades'] = wins
             bot['win_rate'] = (wins / completed * 100) if completed > 0 else 0
 
-            # Strategy state for the dashboard (from the persisted state machine)
-            # and the effective re-entry threshold (the reference's rule:
-            # relaxing after reentry_decay_start_minutes, gone below -500%).
-            cursor.execute('''
-                SELECT COUNT(*) as cnt FROM ohlcv_data WHERE bot_id = ?
-            ''', (bot_id,))
-            current_idx = cursor.fetchone()['cnt'] - 1
-            bot['current_minute_idx'] = current_idx
+            # The bot's strategy (the one it was set up with; the first strategy file in the
+            # model folder if none was stored): its parameters drive the dashboard's lines
+            # and thresholds for this bot.
+            bot['strategy'] = self._strategy_for(bot.get('strategy_name'))
+            params = bot['strategy'].get('params')
+
+            # Effective re-entry threshold price (strategy.passes_reentry_threshold):
+            # after reentry_decay_start_minutes the required drop RELAXES by
+            # reentry_decay_rate per minute; below -5 any price qualifies (no line).
             bot['reentry_price'] = None
             bot['reentry_pct'] = None
-            bot['signal_exit_from_idx'] = None
-            bot['scan_open'] = False
-            bot['reentry_block_active'] = False
-            cfg = get_strategy_config()
-            try:
-                from strategy import SignalExitStrategy, StrategyState
-                engine = SignalExitStrategy(cfg) if cfg else None
-                st = StrategyState.from_json(bot.get('strategy_state'))
-            except Exception:
-                engine, st = None, None
-            if engine is not None and st is not None:
-                bot['signal_exit_enabled'] = engine.signal_on
-                bot['signal_exit_from_idx'] = engine.signal_exit_armed_at(st)
-                bot['scan_open'] = bool(st.scan_open)
-                bot['reentry_block_active'] = bool(st.block_active)
-                bot['take_profit_price'] = engine.take_profit_price(st)
-                bot['loss_floor_price'] = engine.loss_floor_price(st)
-                bot['orig_entry_idx'] = st.orig_entry_idx
-                if bot.get('last_sell_close') and bot['last_sell_close'] > 0 \
-                        and bot.get('last_sell_idx') is not None:
-                    eff = engine.reentry_effective_pct(current_idx, bot['last_sell_idx'])
-                    if eff is not None:
-                        bot['reentry_pct'] = eff
-                        bot['reentry_price'] = bot['last_sell_close'] * (1.0 - eff)
-        bot.pop('strategy_state', None)
+            if params and bot.get('last_sell_close') and bot['last_sell_close'] > 0 \
+                    and bot.get('last_sell_idx') is not None:
+                cursor.execute('''
+                    SELECT COUNT(*) as cnt FROM ohlcv_data WHERE bot_id = ?
+                ''', (bot_id,))
+                current_idx = cursor.fetchone()['cnt'] - 1
+                minutes_since_sell = float(current_idx - bot['last_sell_idx'])
+                effective = effective_reentry_threshold(minutes_since_sell, params)
+                if effective is not None:
+                    bot['reentry_price'] = bot['last_sell_close'] * (1.0 - effective)
+                    bot['reentry_pct'] = effective
 
         # Surface the file-based force-sell flags so the dashboard can show
         # whether the operator has armed a force-sell. These are written by
@@ -283,12 +275,10 @@ class BotManager:
     def initialize_bot(self, bot_id, coin_symbol, pool_address,
                        allocation_type, allocation_value,
                        image_thumb_base64=None, image_small_base64=None,
-                       confidence_threshold=None, max_price_impact_pct=0.00333):
+                       max_price_impact_pct=0.00333, strategy_name=None):
         """
-        Initialize a bot with trading parameters and wallet allocation.
-
-        Note: confidence_threshold is stored in bot_config but unused; the
-        strategy's buy gate comes from strategy_config (best_params.json).
+        Initialize a bot with trading parameters and wallet allocation. strategy_name is a
+        strategy file in the model folder (strategy_<name>.json); the bot trades with it.
         """
         try:
             wallet = get_wallet_status()
@@ -320,7 +310,7 @@ class BotManager:
             initialize_bot_in_db(
                 bot_id, pool_address, coin_symbol, sol_amount,
                 image_thumb_base64, image_small_base64,
-                confidence_threshold, max_price_impact_pct
+                max_price_impact_pct, strategy_name
             )
 
             os.makedirs(f'data/bot_{bot_id}', exist_ok=True)
@@ -516,6 +506,35 @@ class BotManager:
             log_message(f'Error deallocating bot {bot_id}: {str(e)}', bot_id, 'ERROR')
             return {'success': False, 'error': str(e)}
 
+    def pause_all_bots(self):
+        """Pause every running bot; bots that are already paused or stopped stay as they are."""
+        results = []
+        for bot_id in range(1, 11):
+            bot = get_bot(bot_id)
+            if bot and bot['status'] == 'running':
+                results.append({'bot_id': bot_id, 'result': self.pause_bot(bot_id)})
+        log_message(f'Pause all: {len(results)} running bot(s) paused', None, 'INFO')
+        return results
+
+    def resume_all_bots(self):
+        """Start every assigned bot that is paused or stopped; running bots stay as they are."""
+        results = []
+        for bot_id in range(1, 11):
+            bot = get_bot(bot_id)
+            if bot and bot['status'] in ('paused', 'stopped'):
+                results.append({'bot_id': bot_id, 'result': self.resume_bot(bot_id)})
+        log_message(f'Resume all: {len(results)} paused/stopped bot(s) started', None, 'INFO')
+        return results
+
+    def _strategy_for(self, name):
+        """{'name', 'params'} of a bot's strategy, or {'name', 'error'} if it can't be read."""
+        model_dir = (get_global_settings() or {}).get('model_dir') or 'artifacts'
+        try:
+            sname, params = strategy_params(model_dir, name or None)
+            return {'name': sname, 'params': params}
+        except Exception as e:
+            return {'name': name, 'error': str(e)}
+
     def stop_all_bots(self):
         """Emergency stop all running bots."""
         results = []
@@ -559,8 +578,7 @@ class BotManager:
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT timestamp, CAST(prediction AS REAL) as prediction, dir_pct, move_pct,
-                       price_position_15m, price_position_60m
+                SELECT timestamp, CAST(combo AS REAL) as combo, raw_move, raw_dir
                 FROM predictions
                 WHERE bot_id = ?
                 AND timestamp >= ?
@@ -569,7 +587,7 @@ class BotManager:
             ''', (bot_id, oldest_timestamp, newest_timestamp))
             predictions = [dict(row) for row in cursor.fetchall()]
 
-        pred_by_ts = {pred['timestamp']: pred for pred in predictions}
+        score_dict = {pred['timestamp']: pred for pred in predictions}
 
         chart_data = []
         for row in ohlcv:
@@ -581,12 +599,9 @@ class BotManager:
                 'close': row['close'],
                 'volume': row['volume'],
                 'action': row['bot_action'],
-                # combo percentile (buy gate) and the two exit-side scores
-                'confidence': pred_by_ts.get(row['timestamp'], {}).get('prediction'),
-                'dir_pct': pred_by_ts.get(row['timestamp'], {}).get('dir_pct'),
-                'move_pct': pred_by_ts.get(row['timestamp'], {}).get('move_pct'),
-                'pp_15m': pred_by_ts.get(row['timestamp'], {}).get('price_position_15m'),
-                'pp_1h': pred_by_ts.get(row['timestamp'], {}).get('price_position_60m'),
+                'combo': score_dict.get(row['timestamp'], {}).get('combo'),
+                'raw_move': score_dict.get(row['timestamp'], {}).get('raw_move'),
+                'raw_dir': score_dict.get(row['timestamp'], {}).get('raw_dir'),
             })
 
         return chart_data

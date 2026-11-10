@@ -22,7 +22,7 @@ It takes execution parameters in and returns results out.
 Paper-mode economics:
 - execute_buy: entry price is close * (1 + slippage).
 - execute_sell: fill_price_sol is the pre-computed exit price from
-  SignalExitStrategy.exit_fill_price() in strategy.py (close x (1 - slippage)).
+  A50Strategy.exit_fill_price() in strategy.py (close x (1 - slippage)).
   No additional slippage is applied here.
 """
 
@@ -131,7 +131,7 @@ def execute_sell(shares_held, fill_price_sol, entry_price_sol, initial_capital_s
     Execute a sell order (swap token -> SOL).
 
     In paper mode: fill_price_sol is the pre-computed exit price from
-    SignalExitStrategy.exit_fill_price() in strategy.py (the close minus
+    A50Strategy.exit_fill_price() in strategy.py (the close minus
     slippage). No additional slippage is applied.
 
     Fee is derived from the gross price (before slippage):

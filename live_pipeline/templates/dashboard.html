@@ -677,6 +677,14 @@
                 <div class="metric-card" style="background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);">
                     <div class="metric-label">Active Bots</div>
                     <div class="metric-value" id="active-bots">0 / 10</div>
+                    <div style="display: flex; gap: 6px; margin-top: 8px;">
+                        <button id="pause-all-btn" class="btn-warning btn-small" onclick="pauseAllBots()" disabled
+                                style="flex: 1; padding: 5px 6px; font-size: 11.5px; white-space: nowrap;"
+                                title="Pause every running bot; paused bots stay paused">Pause all</button>
+                        <button id="resume-all-btn" class="btn-success btn-small" onclick="resumeAllBots()" disabled
+                                style="flex: 1; padding: 5px 6px; font-size: 11.5px; white-space: nowrap;"
+                                title="Start every paused or stopped bot; running bots keep running">Resume all</button>
+                    </div>
                 </div>
                 <div class="metric-card" style="background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);">
                     <div class="metric-label">Wallet Mode</div>
@@ -933,34 +941,46 @@
             total_value_sol: 0
         };
 
-        // Strategy config (fetched once on load)
+        // The default strategy's parameters (the first strategy file in the model folder;
+        // fetched once on load). Each bot carries its own strategy's parameters in its
+        // status (bot.strategy.params); stratOf(bot) picks those, or the default.
         let strategyConfig = {};
+        // The strategy files in the model folder, for the bot setup dropdown.
+        let strategiesList = { strategies: [], default: null };
 
-        // Strategy: A50, rebase mode (one parameter set from best_params.json;
-        // no tiers). See strategy.py for the exact rules.
-        function cfgNum(key, fallback) {
-            const v = strategyConfig[key];
-            return (v === undefined || v === null) ? fallback : Number(v);
+        function stratOf(bot) {
+            return (bot && bot.strategy && bot.strategy.params) || strategyConfig;
         }
-        function signalExitEnabled() { return !!strategyConfig.signal_exit_enabled; }
-        // se_tp_off only applies inside the signal exit (as in the reference)
-        function takeProfitEnabled() { return !(signalExitEnabled() && cfgNum('se_tp_off', 0) > 0.5); }
-        function getActivationThreshold() { return cfgNum('activation_threshold', 0.32); }
-        function getLossFloorPct() { return cfgNum('loss_floor_pct', 0.17); }
 
-        // The reference's re-entry rule: required drop below the last sale at
-        // `minutesSinceSell`; relaxes by reentry_decay_rate per minute after
-        // reentry_decay_start_minutes (may go negative = above the sale);
-        // null once below -500% (no rule any more).
-        function reentryEffectivePct(minutesSinceSell) {
-            const th = cfgNum('reentry_threshold_pct', 0.005);
-            const start = cfgNum('reentry_decay_start_minutes', 41);
-            const rate = cfgNum('reentry_decay_rate', 0.0067);
-            if (minutesSinceSell > start) {
-                const eff = th - (minutesSinceSell - start) * rate;
-                return eff < -5.0 ? null : eff;
+        function getActivationThreshold(bot) {
+            const s = stratOf(bot);
+            return s.activation_threshold != null ? s.activation_threshold : 0.2;
+        }
+
+        function getLossFloorPct(bot) {
+            const s = stratOf(bot);
+            return s.loss_floor_pct != null ? s.loss_floor_pct : 0.25;
+        }
+
+        function getComboCutoff(bot) {
+            const s = stratOf(bot);
+            return s.combo_cutoff != null ? s.combo_cutoff : 0.35;
+        }
+
+        // The strategy's re-entry threshold (strategy.effective_reentry_threshold):
+        // after the decay start the required drop RELAXES per minute; below -5
+        // any price qualifies (returns null).
+        function getEffectiveReentryThreshold(minutesSinceSell, bot) {
+            const s = stratOf(bot);
+            const reThresh = s.reentry_threshold_pct;
+            if (reThresh == null) return null;
+            const decayStart = s.reentry_decay_start_minutes;
+            const decayRate = s.reentry_decay_rate;
+            if (minutesSinceSell > decayStart) {
+                const effective = reThresh - (minutesSinceSell - decayStart) * decayRate;
+                return effective < -5.0 ? null : effective;
             }
-            return th;
+            return reThresh;
         }
 
         // Render a number using SI prefixes (m, µ, n, p, f) for sub-1 values
@@ -999,6 +1019,17 @@
             }
             // Below femto — fallback (extremely unlikely for any real price)
             return v.toExponential(1);
+        }
+
+        // Write to the DOM only when the content actually changed, so a refresh
+        // that brings no new values leaves the page untouched.
+        function setHTMLIfChanged(el, html) {
+            if (el && el.__html !== html) { el.innerHTML = html; el.__html = html; }
+        }
+        function setTextIfChanged(idOrEl, text) {
+            const el = typeof idOrEl === 'string' ? document.getElementById(idOrEl) : idOrEl;
+            const t = text == null ? '' : String(text);
+            if (el && el.textContent !== t) el.textContent = t;
         }
 
         // Track last candle timestamp per bot to avoid unnecessary redraws
@@ -1061,6 +1092,11 @@
                     allTrades = data.trades;
                 }
 
+                if (data.wallet) {
+                    walletData = data.wallet;
+                    updateWalletDisplay();
+                }
+
                 serverLM = data.last_modified || null;
             } catch (error) {
                 console.error('Error fetching bot data:', error);
@@ -1095,6 +1131,7 @@
                     initAggregateCapitalChart();
                 }
             } else if (tabName === 'manage') {
+                fetchStrategies();   // the artifacts folder may have changed
                 updateManageTab();
                 // Clear timestamp tracker to force chart regeneration when switching to this tab
                 lastCandleTimestamps = {};
@@ -1124,13 +1161,12 @@
                 const response = await fetch('/api/system');
                 const data = await response.json();
                 
-                document.getElementById('uptime').textContent = data.uptime || '--';
-                document.getElementById('cpu').textContent = data.cpu_percent ? data.cpu_percent.toFixed(1) + '%' : '--';
-                document.getElementById('ram').textContent = data.ram_percent ? data.ram_percent.toFixed(1) + '%' : '--';
+                setTextIfChanged('uptime', data.uptime || '--');
+                setTextIfChanged('cpu', data.cpu_percent ? data.cpu_percent.toFixed(1) + '%' : '--');
+                setTextIfChanged('ram', data.ram_percent ? data.ram_percent.toFixed(1) + '%' : '--');
                 
                 if (data.ram_used_gb && data.ram_total_gb) {
-                    document.getElementById('ram-detail').textContent = 
-                        `${data.ram_used_gb.toFixed(1)} / ${data.ram_total_gb.toFixed(1)} GB`;
+                    setTextIfChanged('ram-detail', `${data.ram_used_gb.toFixed(1)} / ${data.ram_total_gb.toFixed(1)} GB`);
                 }
             } catch (error) {
                 console.error('Error fetching system stats:', error);
@@ -1144,12 +1180,11 @@
         
                 if (data.price_usd) {
                     currentSolPrice = data.price_usd;
-                    document.getElementById('sol-price').textContent = '$' + currentSolPrice.toFixed(2);
+                    setTextIfChanged('sol-price', '$' + currentSolPrice.toFixed(2));
             
                     if (data.timestamp) {
                         const updateTime = new Date(data.timestamp);
-                        document.getElementById('sol-price-update').textContent = 
-                            'Updated ' + updateTime.toLocaleTimeString();
+                        setTextIfChanged('sol-price-update', 'Updated ' + updateTime.toLocaleTimeString());
                     }
             
                     // Update bot capital displays
@@ -1205,17 +1240,17 @@
                 const totalSol = walletData.total_value_sol != null
                     ? walletData.total_value_sol
                     : walletData.wallet_sol;
-                document.getElementById('wallet-total-sol').textContent = totalSol.toFixed(4) + ' SOL';
-                document.getElementById('wallet-total-usd').textContent = '$' + (totalSol * currentSolPrice).toFixed(2);
+                setTextIfChanged('wallet-total-sol', totalSol.toFixed(4) + ' SOL');
+                setTextIfChanged('wallet-total-usd', '$' + (totalSol * currentSolPrice).toFixed(2));
         
-                document.getElementById('wallet-allocated-sol').textContent = walletData.allocated_sol.toFixed(4) + ' SOL';
-                document.getElementById('wallet-allocated-usd').textContent = '$' + (walletData.allocated_sol * currentSolPrice).toFixed(2);
+                setTextIfChanged('wallet-allocated-sol', walletData.allocated_sol.toFixed(4) + ' SOL');
+                setTextIfChanged('wallet-allocated-usd', '$' + (walletData.allocated_sol * currentSolPrice).toFixed(2));
         
-                document.getElementById('wallet-unallocated-sol').textContent = walletData.unallocated_wallet_sol.toFixed(4) + ' SOL';
-                document.getElementById('wallet-unallocated-usd').textContent = '$' + (walletData.unallocated_wallet_sol * currentSolPrice).toFixed(2);
+                setTextIfChanged('wallet-unallocated-sol', walletData.unallocated_wallet_sol.toFixed(4) + ' SOL');
+                setTextIfChanged('wallet-unallocated-usd', '$' + (walletData.unallocated_wallet_sol * currentSolPrice).toFixed(2));
         
-                document.getElementById('wallet-fees-sol').textContent = walletData.total_fees_sol.toFixed(6) + ' SOL';
-                document.getElementById('wallet-fees-usd').textContent = '$' + (walletData.total_fees_sol * currentSolPrice).toFixed(2);
+                setTextIfChanged('wallet-fees-sol', walletData.total_fees_sol.toFixed(6) + ' SOL');
+                setTextIfChanged('wallet-fees-usd', '$' + (walletData.total_fees_sol * currentSolPrice).toFixed(2));
             }
         }
 
@@ -1425,8 +1460,101 @@
         }
         
         function updateActiveBotCount() {
-            const activeBots = botsData.filter(b => b.status !== 'inactive').length;
-            document.getElementById('active-bots').textContent = `${activeBots} / 10`;
+            const assigned = botsData.filter(b => b.status !== 'inactive');
+            setTextIfChanged('active-bots', `${assigned.length} / 10`);
+            // Pause all acts on the running bots, Resume all on the paused and stopped ones;
+            // each leaves the others as they are.
+            const running = assigned.filter(b => b.status === 'running').length;
+            const idle = assigned.filter(b => b.status === 'paused' || b.status === 'stopped').length;
+            const pauseBtn = document.getElementById('pause-all-btn');
+            const resumeBtn = document.getElementById('resume-all-btn');
+            if (pauseBtn) {
+                setTextIfChanged(pauseBtn, running ? `Pause all (${running})` : 'Pause all');
+                if (pauseBtn.disabled !== (running === 0) && !pauseBtn.dataset.busy) pauseBtn.disabled = running === 0;
+            }
+            if (resumeBtn) {
+                setTextIfChanged(resumeBtn, idle ? `Resume all (${idle})` : 'Resume all');
+                if (resumeBtn.disabled !== (idle === 0) && !resumeBtn.dataset.busy) resumeBtn.disabled = idle === 0;
+            }
+        }
+
+        async function setAllBots(action) {
+            const assigned = botsData.filter(b => b.status !== 'inactive');
+            const targets = action === 'pause'
+                ? assigned.filter(b => b.status === 'running')
+                : assigned.filter(b => b.status === 'paused' || b.status === 'stopped');
+            if (!targets.length) return;
+            const names = targets.map(b => `${b.name} (${b.coin_symbol || '—'})`).join(', ');
+            const question = action === 'pause'
+                ? `Pause the ${targets.length} running bot(s)?\n\n${names}\n\nBots that are already paused stay paused. Open positions stay open until a bot is resumed.`
+                : `Start the ${targets.length} paused or stopped bot(s)?\n\n${names}\n\nBots that are already running keep running.`;
+            if (!confirm(question)) return;
+            const btn = document.getElementById(action === 'pause' ? 'pause-all-btn' : 'resume-all-btn');
+            if (btn) { btn.dataset.busy = '1'; btn.disabled = true; }
+            try {
+                const response = await fetch(`/api/bots/${action}-all`, { method: 'POST' });
+                const result = await response.json();
+                if (!result.success) alert(`Some bots could not be ${action === 'pause' ? 'paused' : 'started'}: ${result.error}`);
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+            } finally {
+                if (btn) delete btn.dataset.busy;
+                await fetchBotStatus();
+                updateAll();
+            }
+        }
+        const pauseAllBots = () => setAllBots('pause');
+        const resumeAllBots = () => setAllBots('resume');
+
+        // ---- strategy dropdown (bot setup) ----
+        async function fetchStrategies() {
+            try {
+                const response = await fetch('/api/strategies');
+                strategiesList = await response.json();
+            } catch (error) {
+                console.error('Error fetching strategies:', error);
+            }
+            refreshStrategySelects();
+        }
+
+        // The selected strategy, or the default (the first usable strategy file).
+        function chosenStrategy(name) {
+            const usable = (strategiesList.strategies || []).filter(s => s.valid);
+            return usable.find(s => s.name === name) || usable.find(s => s.name === strategiesList.default) || null;
+        }
+
+        function strategyOptionsHtml(selectedName) {
+            const list = strategiesList.strategies || [];
+            if (!list.length) return '<option value="">No strategies in the artifacts folder</option>';
+            const chosen = chosenStrategy(selectedName);
+            return list.map(s => {
+                const label = s.valid ? s.name + (s.name === strategiesList.default ? ' (default)' : '')
+                                      : `${s.name} (unusable: other models)`;
+                return `<option value="${s.name}" ${chosen && s.name === chosen.name ? 'selected' : ''} ${s.valid ? '' : 'disabled'}>${label}</option>`;
+            }).join('');
+        }
+
+        function strategyInfoHtml(selectedName) {
+            const s = chosenStrategy(selectedName);
+            if (!s) return 'Copy the files of strategy.ipynb\'s live_artifacts/ folder into live_pipeline/artifacts/.';
+            const scores = s.test_score != null ? ` — test $${s.test_score.toFixed(2)}, val $${(s.val_score || 0).toFixed(2)}` : '';
+            const run = s.run != null ? `run ${s.run} of ${s.n_runs}, chosen by ${s.selected_by} score${scores}` : '';
+            return `Buys when P(move) × P(direction) ≥ ${s.combo_cutoff.toFixed(4)}${run ? '<br>' + run : ''}`;
+        }
+
+        function refreshStrategySelects() {
+            document.querySelectorAll('select[data-strategy-select]').forEach(sel => {
+                const botId = parseInt(sel.dataset.strategySelect, 10);
+                const current = sel.value || botInitInputs[botId]?.strategy_name;
+                setHTMLIfChanged(sel, strategyOptionsHtml(current));
+                setHTMLIfChanged(document.getElementById(`init-strategy-info-${botId}`), strategyInfoHtml(sel.value));
+            });
+        }
+
+        function onStrategySelect(botId) {
+            const sel = document.getElementById(`init-strategy-${botId}`);
+            botInitInputs[botId] = Object.assign({}, botInitInputs[botId], { strategy_name: sel.value });
+            setHTMLIfChanged(document.getElementById(`init-strategy-info-${botId}`), strategyInfoHtml(sel.value));
         }
 
         // ============================================
@@ -1565,6 +1693,9 @@
                         
                                 <span class="bot-stat-label">Assigned duration:</span>
                                 <span class="bot-stat-value">${bot.assigned_duration || '0d 0h 0m'}</span>
+
+                                <span class="bot-stat-label">Strategy:</span>
+                                <span class="bot-stat-value"${bot.strategy && bot.strategy.error ? ' style="color: var(--danger);" title="' + bot.strategy.error.replace(/"/g, '&quot;') + '"' : ''}>${(bot.strategy && bot.strategy.name) || '—'}</span>
                             </div>
                     
                             <!-- Bot action buttons -->
@@ -1673,14 +1804,12 @@
                             
                             <div class="grid-2" style="margin-top: 12px;">
                                 <div class="form-group">
-                                    <label>Entry Gate</label>
-                                    <div style="font-size: 12px; color: var(--text-muted); padding: 8px; background: var(--bg-secondary); border-radius: 6px; line-height: 1.6;">
-                                        From best_params.json<br>
-                                        Combo ≥ ${cfgNum('confidence_threshold', 0).toFixed(4)}&nbsp;
-                                        PP15m ≤ ${cfgNum('max_price_position_15m', 0).toFixed(3)}&nbsp;
-                                        PP1h ≤ ${cfgNum('max_price_position_60m', 0).toFixed(3)}<br>
-                                        Take-profit +${(getActivationThreshold() * 100).toFixed(1)}% ·
-                                        Signal exit ${signalExitEnabled() ? 'on' : 'off'}
+                                    <label for="init-strategy-${bot.id}">Strategy</label>
+                                    <select id="init-strategy-${bot.id}" data-strategy-select="${bot.id}" onchange="onStrategySelect(${bot.id})">
+                                        ${strategyOptionsHtml(botInitInputs[bot.id]?.strategy_name)}
+                                    </select>
+                                    <div id="init-strategy-info-${bot.id}" style="font-size: 11px; color: var(--text-muted); margin-top: 4px; line-height: 1.5;">
+                                        ${strategyInfoHtml(botInitInputs[bot.id]?.strategy_name)}
                                     </div>
                                 </div>
                                 <div class="form-group">
@@ -1849,8 +1978,10 @@
                 const isInitializing = bot.status === 'running' && bot.initializing;
                 const card = document.getElementById(`bot-card-${bot.id}`);
                 if (card) {
-                    card.style.borderLeftColor = isInitializing ? 'var(--primary)' : '';
-                    card.style.background = isInitializing ? 'rgba(102, 126, 234, 0.15)' : '';
+                    const border = isInitializing ? 'var(--primary)' : '';
+                    const bg = isInitializing ? 'rgba(102, 126, 234, 0.15)' : '';
+                    if (card.style.borderLeftColor !== border) card.style.borderLeftColor = border;
+                    if (card.style.background !== bg) card.style.background = bg;
                 }
                 const badge = document.getElementById(`bot-badge-${bot.id}`);
                 if (badge) {
@@ -1860,8 +1991,9 @@
                     const statusText = isInitializing ? 'INITIALISING' :
                         bot.status === 'running' ? 'RUNNING' :
                         bot.status === 'paused' ? 'PAUSED' : 'STOPPED';
-                    badge.className = `bot-status-badge ${badgeClass}`;
-                    badge.textContent = statusText;
+                    const cls = `bot-status-badge ${badgeClass}`;
+                    if (badge.className !== cls) badge.className = cls;
+                    setTextIfChanged(badge, statusText);
                 }
 
                 // Update bot info card stats
@@ -1871,7 +2003,7 @@
                 // Update individual trade history
                 const tradeHistoryDiv = document.querySelector(`#bot-${bot.id}-trade-history`);
                 if (tradeHistoryDiv) {
-                    tradeHistoryDiv.innerHTML = getBotTradeHistory(bot.id);
+                    setHTMLIfChanged(tradeHistoryDiv, getBotTradeHistory(bot.id));
                 }
             });
         }
@@ -1884,29 +2016,39 @@
 
             const isOpen = bot.position === 'open';
             const inRace = bot.trade_phase && bot.trade_phase !== 'normal';
-            const hasData = bot.latest_prediction != null;
+            const hasData = bot.latest_combo != null;
 
-            // One parameter set (best_params.json); no tiers.
-            const confThresh = cfgNum('confidence_threshold', 0.23);
-            const pp15mMax = cfgNum('max_price_position_15m', 0.73);
-            const pp60mMax = cfgNum('max_price_position_60m', 0.89);
+            // Strategy params
+            const strat = stratOf(bot);
+            const confThresh = getComboCutoff(bot);
+            const pp15mMax = strat.max_price_position_15m != null ? strat.max_price_position_15m : 0.8;
+            const pp60mMax = strat.max_price_position_60m != null ? strat.max_price_position_60m : 0.7;
 
-            // Current values (prediction = combo percentile; pp_60m = price_position_1h)
-            const combo = bot.latest_prediction;
+            // Current values
+            const prediction = bot.latest_combo;
             const pp15m = bot.latest_pp_15m;
             const pp60m = bot.latest_pp_60m;
             const currentClose = bot.latest_close;
             const reentryPrice = bot.reentry_price;
             const reentryPct = bot.reentry_pct;
+            const effectiveActPct = bot.latest_activation_pct;
 
-            // Entry conditions matter when flat, or in a race (a candidate can
-            // re-anchor the position there).
+            // Entry conditions — active when closed OR stale (searching for re-entry)
             const entryActive = hasData && (!isOpen || inRace);
-            const confMet = entryActive && combo >= confThresh;
+            const confMet = entryActive && prediction >= confThresh;
             const pp15mMet = entryActive && pp15m != null && pp15m <= pp15mMax;
             const pp60mMet = entryActive && pp60m != null && pp60m <= pp60mMax;
+            // Re-entry gate is "active" whenever the strategy is still applying
+            // it — i.e. get_bot_status returned a threshold (effective >= -5.0),
+            // which is exactly when the chart draws the re-entry line. It stays
+            // active (progressively looser) as the required drop decays past 0
+            // into "allow at/above sell", so we no longer gate on pct > 0, which
+            // made this panel disagree with the chart once decay crossed zero.
             const reentryActive = reentryPct != null;
             const reentryMet = reentryActive && currentClose != null && reentryPrice != null && currentClose <= reentryPrice;
+
+            // Activation monitoring active while a position is open (activation = sell)
+            const activationActive = isOpen && effectiveActPct != null;
 
             // Slider builder. `markLabel` renders to the LEFT of the
             // threshold line at the same Y; `arrowLabel` renders to the
@@ -1962,7 +2104,7 @@
                 `;
             }
 
-            // Entry title color: grey if open (not in a race), green if met, red if not
+            // Entry title color: grey if open (not stale), green if met, red if not
             function entryColor(met, isReentry = false) {
                 if (isOpen && !inRace) return '#6b7280';
                 if (!hasData) return '#6b7280';
@@ -1970,81 +2112,109 @@
                 return met ? '#10b981' : '#ef4444';
             }
 
-            // --- Combo percentile (1.0 top, 0.0 bottom) ---
+            // --- Combo = P(move) x P(direction) (0 bottom, 2 x cutoff top) ---
+            const confMax = Math.min(1.0, confThresh * 2), confMin = 0.0;
+            const confMarkPct = ((confMax - confThresh) / (confMax - confMin)) * 100;
+            const confVal = entryActive ? Math.max(confMin, Math.min(confMax, prediction || 0)) : null;
+            const confArrowPct = confVal != null ? ((confMax - confVal) / (confMax - confMin)) * 100 : null;
             const confSlider = buildSlider('Combo', entryColor(confMet),
-                '1.00', '0.00', (1 - confThresh) * 100,
-                entryActive ? (1 - Math.max(0, Math.min(1, combo || 0))) * 100 : null, entryActive,
-                confThresh.toFixed(2), entryActive && combo != null ? combo.toFixed(2) : '');
+                confMax.toFixed(2), confMin.toFixed(2), confMarkPct, confArrowPct, entryActive,
+                confThresh.toFixed(3),
+                entryActive && prediction != null ? prediction.toFixed(3) : '');
 
-            // --- Price position 15m / 1h (100% top, 0% bottom) ---
+            // --- PP 15m (100% top, 0% bottom) ---
+            const pp15mMarkPct = (1 - pp15mMax) * 100;
+            const pp15mArrowPct = entryActive && pp15m != null ? (1 - pp15m) * 100 : null;
             const pp15mSlider = buildSlider('Price Pos 15m', entryColor(pp15mMet),
-                '100%', '0%', (1 - pp15mMax) * 100,
-                entryActive && pp15m != null ? (1 - pp15m) * 100 : null, entryActive,
-                (pp15mMax * 100).toFixed(0) + '%', entryActive && pp15m != null ? (pp15m * 100).toFixed(0) + '%' : '');
-            const pp60mSlider = buildSlider('Price Pos 1h', entryColor(pp60mMet),
-                '100%', '0%', (1 - pp60mMax) * 100,
-                entryActive && pp60m != null ? (1 - pp60m) * 100 : null, entryActive,
-                (pp60mMax * 100).toFixed(0) + '%', entryActive && pp60m != null ? (pp60m * 100).toFixed(0) + '%' : '');
+                '100%', '0%', pp15mMarkPct, pp15mArrowPct, entryActive,
+                (pp15mMax * 100).toFixed(0) + '%',
+                entryActive && pp15m != null ? (pp15m * 100).toFixed(0) + '%' : '');
 
-            // --- Re-entry (price; threshold in the middle, ±10% of the sale around it) ---
+            // --- PP 60m (100% top, 0% bottom) ---
+            const pp60mMarkPct = (1 - pp60mMax) * 100;
+            const pp60mArrowPct = entryActive && pp60m != null ? (1 - pp60m) * 100 : null;
+            const pp60mSlider = buildSlider('Price Pos 60m', entryColor(pp60mMet),
+                '100%', '0%', pp60mMarkPct, pp60mArrowPct, entryActive,
+                (pp60mMax * 100).toFixed(0) + '%',
+                entryActive && pp60m != null ? (pp60m * 100).toFixed(0) + '%' : '');
+
+            // --- Re-entry (price units, top = HIGH price, bottom = LOW price) ---
+            // Bounds span ±50% around the threshold percentage. In price
+            // terms the symmetric percentage spread maps to two prices —
+            // we take max/min to be defensive against decay producing
+            // negative thresholds (which would flip the price ordering).
+            // Threshold price sits at 50% of the slider regardless.
             let reentrySlider;
-            if (entryActive && reentryActive && currentClose != null && bot.last_sell_close > 0 && reentryPrice != null) {
+            const reentryIsActive = entryActive && reentryActive;
+            if (reentryIsActive && currentClose != null && bot.last_sell_close > 0 && reentryPrice != null) {
                 const sellClose = bot.last_sell_close;
-                const topPrice = reentryPrice + 0.1 * sellClose;
-                const bottomPrice = Math.max(0, reentryPrice - 0.1 * sellClose);
+                const reMaxPrice = sellClose * (1 - reentryPct * 1.5);
+                const reMinPrice = sellClose * (1 - reentryPct * 0.5);
+                const topPrice = Math.max(reMaxPrice, reMinPrice);
+                const bottomPrice = Math.min(reMaxPrice, reMinPrice);
                 const span = topPrice - bottomPrice;
-                const reMarkPct = ((topPrice - reentryPrice) / span) * 100;
-                const reArrowPct = currentClose >= topPrice ? 0 : (currentClose <= bottomPrice ? 100
-                    : ((topPrice - currentClose) / span) * 100);
-                reentrySlider = buildSlider('Re-entry', entryColor(reentryMet, true),
-                    formatPriceSI(topPrice), formatPriceSI(bottomPrice), reMarkPct, reArrowPct, true,
-                    formatPriceSI(reentryPrice), formatPriceSI(currentClose));
+
+                if (span > 0) {
+                    const reMarkPct = ((topPrice - reentryPrice) / span) * 100;
+                    let reArrowPct;
+                    if (currentClose >= topPrice) reArrowPct = 0;
+                    else if (currentClose <= bottomPrice) reArrowPct = 100;
+                    else reArrowPct = ((topPrice - currentClose) / span) * 100;
+
+                    reentrySlider = buildSlider('Re-entry', entryColor(reentryMet, true),
+                        formatPriceSI(topPrice), formatPriceSI(bottomPrice),
+                        reMarkPct, reArrowPct, true,
+                        formatPriceSI(reentryPrice), formatPriceSI(currentClose));
+                } else {
+                    reentrySlider = buildSlider('Re-entry', '#6b7280', '', '', null, null, false);
+                }
             } else {
-                reentrySlider = buildSlider('Re-entry', '#6b7280', '', '', null, null, false);
+                reentrySlider = buildSlider('Re-entry', '#6b7280',
+                    '', '', null, null, false);
             }
 
-            // --- Take-profit (price; from the segment reference up to 1.5x the target gain) ---
-            let tpSlider;
-            const actPct = getActivationThreshold();
-            if (isOpen && takeProfitEnabled() && currentClose != null && bot.entry_price_sol > 0) {
-                const ref = bot.entry_price_sol;
-                const topPrice = ref * (1 + actPct * 1.5);
-                const targetPrice = ref * (1 + actPct);
-                const span = topPrice - ref;
-                const aArrowPct = currentClose >= topPrice ? 0 : (currentClose <= ref ? 100
-                    : ((topPrice - currentClose) / span) * 100);
-                tpSlider = buildSlider('Take-profit', '#e2e8f0', formatPriceSI(topPrice), formatPriceSI(ref),
-                    ((topPrice - targetPrice) / span) * 100, aArrowPct, true,
-                    formatPriceSI(targetPrice), formatPriceSI(currentClose));
+            // --- Activation (price units, top = HIGH price, bottom = entry price) ---
+            // Hitting activation = sell, so this is the live "how close
+            // to exit" gauge. Range spans from entry (no gain, bottom)
+            // up to 1.5× the activation gain (top). Threshold sits at
+            // 33% from the top, matching aUpper = 1.5 × actPct.
+            let activationSlider;
+            if (activationActive && currentClose != null && bot.entry_price_sol > 0 && effectiveActPct > 0) {
+                const entryPrice = bot.entry_price_sol;
+                const aUpper = effectiveActPct * 1.5;
+                const topPrice = entryPrice * (1 + aUpper);
+                const bottomPrice = entryPrice;  // entry × (1 + 0)
+                const activationPrice = entryPrice * (1 + effectiveActPct);
+                const span = topPrice - bottomPrice;
+
+                if (span > 0) {
+                    const aMarkPct = ((topPrice - activationPrice) / span) * 100;
+                    let aArrowPct;
+                    if (currentClose >= topPrice) aArrowPct = 0;
+                    else if (currentClose <= bottomPrice) aArrowPct = 100;
+                    else aArrowPct = ((topPrice - currentClose) / span) * 100;
+
+                    activationSlider = buildSlider('Activation', '#e2e8f0',
+                        formatPriceSI(topPrice), formatPriceSI(bottomPrice),
+                        aMarkPct, aArrowPct, true,
+                        formatPriceSI(activationPrice), formatPriceSI(currentClose));
+                } else {
+                    activationSlider = buildSlider('Activation', '#6b7280', '', '', null, null, false);
+                }
             } else {
-                tpSlider = buildSlider('Take-profit', '#6b7280', '', '', null, null, false);
+                activationSlider = buildSlider('Activation', '#6b7280',
+                    '', '', null, null, false);
             }
 
-            // --- Signal exit (only when enabled): direction / move percentiles ---
-            let signalSliders = '';
-            if (signalExitEnabled()) {
-                const armed = isOpen && bot.signal_exit_from_idx != null
-                    && bot.current_minute_idx >= bot.signal_exit_from_idx;
-                const mk = (title, val, thr) => {
-                    const fires = armed && val != null && val < thr;
-                    return buildSlider(title, armed ? (fires ? '#ef4444' : '#10b981') : '#6b7280',
-                        '1.00', '0.00', (1 - thr) * 100, armed && val != null ? (1 - val) * 100 : null, armed,
-                        thr.toFixed(2), armed && val != null ? val.toFixed(2) : '');
-                };
-                signalSliders = mk('Direction', bot.latest_dir_pct, cfgNum('se_dir', 0)) +
-                                mk('Move', bot.latest_move_pct, cfgNum('se_move', 0));
-            }
-
-            panel.innerHTML = `
+            setHTMLIfChanged(panel, `
                 <div style="display:flex;gap:6px;justify-content:center;padding:0 2px;height:100%;">
                     ${confSlider}
                     ${pp15mSlider}
                     ${pp60mSlider}
                     ${reentrySlider}
-                    ${tpSlider}
-                    ${signalSliders}
+                    ${activationSlider}
                 </div>
-            `;
+            `);
         }
 
         async function updateBotInfoCard(botId) {
@@ -2193,24 +2363,14 @@
                 })();
 
                 // ---- Strategy-group value fragments ----
-                const fmtScore = v => (v == null ? '—' : Number(v).toFixed(3));
-                const scoresValue = `${fmtScore(bot.latest_prediction)}`;
-                const scoresSub = `combo (buy ≥ ${cfgNum('confidence_threshold', 0).toFixed(3)}) · direction ${fmtScore(bot.latest_dir_pct)} · move ${fmtScore(bot.latest_move_pct)}`;
-                const activationValue = takeProfitEnabled() ? '+' + (getActivationThreshold() * 100).toFixed(2) + '%' : 'off';
-                const tpSub = (isOpen && bot.take_profit_price) ? `at ${formatPriceSI(bot.take_profit_price)} SOL` : 'peak close vs the segment reference';
-                const lossFloorValue = '-' + (getLossFloorPct() * 100).toFixed(2) + '%';
-                const lossFloorSub = `${cfgNum('loss_floor_consecutive_minutes', 0)} min in a row → race (never sells)` +
-                    ((isOpen && bot.loss_floor_price) ? ` · at ${formatPriceSI(bot.loss_floor_price)} SOL` : '');
-                const staleValue = `${cfgNum('stale_trade_minutes', 0)} min`;
-                const signalExitValue = (() => {
-                    if (!signalExitEnabled()) return 'Off';
-                    if (!isOpen || bot.signal_exit_from_idx == null) return 'On';
-                    const left = bot.signal_exit_from_idx - bot.current_minute_idx;
-                    return left > 0 ? `Armed in ${left}m` : '<span style="color: var(--warning);">Armed</span>';
-                })();
-                const signalExitSub = signalExitEnabled()
-                    ? `direction < ${cfgNum('se_dir', 0).toFixed(3)} or move < ${cfgNum('se_move', 0).toFixed(3)} after ${cfgNum('se_min_hold', 0)} min`
-                    : 'disabled (strategy_config.signal_exit_enabled)';
+                const comboValue = bot.latest_combo != null ? bot.latest_combo.toFixed(4) : '—';
+                const comboSub = (bot.latest_raw_move != null && bot.latest_raw_dir != null)
+                    ? `move ${bot.latest_raw_move.toFixed(3)} × dir ${bot.latest_raw_dir.toFixed(3)} (buy ≥ ${getComboCutoff(bot).toFixed(4)})`
+                    : `buy ≥ ${getComboCutoff(bot).toFixed(4)}`;
+                const activationValue = '+' + (getActivationThreshold(bot) * 100).toFixed(2) + '%';
+                const lossFloorValue = '-' + (getLossFloorPct(bot) * 100).toFixed(2) + '%';
+                const strategyName = (bot.strategy && bot.strategy.name) || '—';
+                const strategySub = (bot.strategy && bot.strategy.error) ? `<span style="color: var(--danger);">${bot.strategy.error}</span>` : '';
                 const maxImpactPct = bot.max_price_impact_pct || 0.00333;
                 const maxImpactValue = (maxImpactPct * 100).toFixed(3) + '%';
                 // Express the impact cap in SOL using the current liquidity
@@ -2221,7 +2381,7 @@
                     ? `≈ ${formatSOL(liqSol1pct * (maxImpactPct * 100), 4)} at current liquidity`
                     : 'liquidity n/a';
 
-                infoCard.innerHTML = `
+                setHTMLIfChanged(infoCard, `
                     <!-- Headline strip: the numbers you glance at first -->
                     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 22px;">
                         <div style="background: rgba(255,255,255,0.03); border: 1px solid var(--dark-border); border-radius: 8px; padding: 12px 14px;">
@@ -2277,11 +2437,10 @@
                             isOpen ? 1 : 0.5)}
 
                         ${section('Strategy',
-                            metric('Scores', scoresValue, scoresSub) +
-                            metric('Take-profit', activationValue, tpSub) +
-                            metric('Loss Floor', lossFloorValue, lossFloorSub) +
-                            metric('Stale Time', staleValue, 'starts a race (never sells)') +
-                            metric('Signal Exit', signalExitValue, signalExitSub) +
+                            metric('Strategy', strategyName, strategySub) +
+                            metric('Combo Score', comboValue, comboSub) +
+                            metric('Activation Threshold', activationValue) +
+                            metric('Loss Floor', lossFloorValue) +
                             metric('Max Price Impact', maxImpactValue, maxImpactSol) +
                             metric('Re-entries', String(bot.n_reentries || 0))
                         )}
@@ -2293,7 +2452,7 @@
                             metric('Assigned', assignedDisplay)
                         )}
                     </div>
-                `;
+                `);
             } catch (error) {
                 console.error(`Error updating bot info card ${botId}:`, error);
             }
@@ -2523,7 +2682,7 @@
                 });
             }
     
-            allocationList.innerHTML = html;
+            setHTMLIfChanged(allocationList, html);
     
             // Create bar chart for capital overview
             if (walletData.initialized) {
@@ -2712,66 +2871,35 @@
                         return d.close >= d.open ? '#10b981' : '#ef4444'; // Green if up, red if down
                     });
 
-                    // Extract confidence data
-                    const confidences = chartData.map(d => d.confidence !== undefined && d.confidence !== null ? d.confidence : null);
-
-                    // Candidate ribbon: green where the minute passes the entry
-                    // gate (combo >= threshold and both price-position filters);
-                    // the hover shows the three scores. Thin strip below the scores.
-                    const confThresh = cfgNum('confidence_threshold', 0.23);
-                    const pp15mMax = cfgNum('max_price_position_15m', 0.73);
-                    const pp60mMax = cfgNum('max_price_position_60m', 0.89);
-                    const ribbonColors = [];
-                    const ribbonHoverText = [];
-                    for (const d of chartData) {
-                        if (d.confidence == null) {
-                            ribbonColors.push('rgba(55, 65, 81, 0.35)');
-                            ribbonHoverText.push('No scores');
-                            continue;
-                        }
-                        const cand = d.confidence >= confThresh && d.pp_15m != null && d.pp_15m <= pp15mMax
-                            && d.pp_1h != null && d.pp_1h <= pp60mMax;
-                        ribbonColors.push(cand ? 'rgba(16, 185, 129, 0.45)' : 'rgba(96, 165, 250, 0.12)');
-                        ribbonHoverText.push(`${cand ? 'Entry candidate' : 'No entry'} · combo ${d.confidence.toFixed(3)}` +
-                            ` · direction ${d.dir_pct != null ? d.dir_pct.toFixed(3) : '—'}` +
-                            ` · move ${d.move_pct != null ? d.move_pct.toFixed(3) : '—'}`);
-                    }
-                    const ribbonAnnotations = [];
-                    const thresholdShapes = [{
-                        type: 'line', xref: 'paper', yref: 'y3', x0: 0, x1: 1,
-                        y0: confThresh, y1: confThresh,
-                        line: { color: 'rgba(16, 185, 129, 0.6)', width: 1, dash: 'dot' }
-                    }];
+                    // Model scores: P(move), P(direction) and combo = P(move) x P(direction), the buy score
+                    const scoreOf = (k) => chartData.map(d => d[k] !== undefined && d[k] !== null ? d[k] : null);
+                    const confidences = scoreOf('combo');
+                    const rawMoves = scoreOf('raw_move');
+                    const rawDirs = scoreOf('raw_dir');
 
                     const traces = [
-                        // Confidence line (top chart)
+                        // Model scores (top chart): P(move) red, P(direction) blue,
+                        // combo orange and 50% thicker as the main line
                         {
-                            x: timestamps,
-                            y: confidences,
-                            type: 'scatter',
-                            mode: 'lines',
-                            name: 'Combo',
-                            line: {
-                                color: '#60a5fa',
-                                width: 1
-                            },
+                            x: timestamps, y: rawMoves,
+                            type: 'scatter', mode: 'lines', name: 'Move',
+                            line: { color: '#ff6b5e', width: 1 },
+                            yaxis: 'y3',
+                            hovertemplate: 'Move: %{y:.3f}<extra></extra>'
+                        },
+                        {
+                            x: timestamps, y: rawDirs,
+                            type: 'scatter', mode: 'lines', name: 'Direction',
+                            line: { color: '#4fb3ff', width: 1 },
+                            yaxis: 'y3',
+                            hovertemplate: 'Direction: %{y:.3f}<extra></extra>'
+                        },
+                        {
+                            x: timestamps, y: confidences,
+                            type: 'scatter', mode: 'lines', name: 'Combo',
+                            line: { color: '#ff9a1f', width: 1.5 },
                             yaxis: 'y3',
                             hovertemplate: 'Combo: %{y:.4f}<extra></extra>'
-                        },
-                        // Entry-candidate ribbon
-                        {
-                            x: timestamps,
-                            y: timestamps.map(() => 1),
-                            type: 'bar',
-                            width: timestamps.map(() => 60000),
-                            marker: {
-                                color: ribbonColors,
-                                line: { width: 0 }
-                            },
-                            text: ribbonHoverText,
-                            hovertemplate: '%{text}<extra></extra>',
-                            yaxis: 'y4',
-                            showlegend: false
                         },
                         {
                             x: timestamps,
@@ -2832,21 +2960,21 @@
                     }
 
                     // ----------------------------------------------------------
-                    // Take-profit target and loss floor, shown only while a
-                    // position is open (one parameter set, no tiers):
-                    //   Take-profit — reference x (1 + activation_threshold)
-                    //   Loss Floor  — reference x (1 - loss_floor_pct)  (starts a race; never sells)
-                    // The reference is bot.entry_price_sol = the current segment's
-                    // reference (the buy fill, or the close of the last rebase), so
-                    // the lines start at bot.entry_timestamp and reset on a rebase.
+                    // Threshold lines, shown only while a position is open:
+                    //
+                    //   Activation Target — entry_price * (1 + activation_threshold)
+                    //   Loss Floor        — entry_price * (1 - loss_floor_pct)
+                    //
+                    // The reference is bot.entry_price_sol, which the bot
+                    // updates on re-entry, so the lines automatically reset
+                    // to the new segment's entry after a re-entry. They start
+                    // at the current segment's entry timestamp (bot.entry_timestamp),
+                    // not the first BUY of the trade cycle.
                     if (data.bot && data.bot.position === 'open' && data.bot.entry_price_sol) {
                         const segmentEntryPrice = data.bot.entry_price_sol;
                         const segmentEntryTs = data.bot.entry_timestamp
                             ? new Date(data.bot.entry_timestamp).getTime()
                             : null;
-                        const actPct = getActivationThreshold();
-                        const floorPct = getLossFloorPct();
-                        const showTp = takeProfitEnabled();
 
                         const lineTs = [];
                         const actY  = [];
@@ -2860,13 +2988,21 @@
                                 const tMs = new Date(d.timestamp).getTime();
                                 if (tMs < segmentEntryTs) continue;
                             }
+                            const actPct  = getActivationThreshold(data.bot);
+                            const floorPct = getLossFloorPct(data.bot);
                             const actPrice   = segmentEntryPrice * (1 + actPct);
                             const floorPrice = segmentEntryPrice * (1 - floorPct);
                             lineTs.push(d.timestamp);
-                            actY.push(showTp ? actPrice : null);
+                            actY.push(actPrice);
                             floorY.push(floorPrice);
-                            actHover.push(`Take-profit: ${actPrice.toFixed(8)} SOL (+${(actPct * 100).toFixed(2)}%)`);
-                            floorHover.push(`Loss Floor: ${floorPrice.toFixed(8)} SOL (-${(floorPct * 100).toFixed(2)}%, race only)`);
+                            actHover.push(
+                                `Activation: ${actPrice.toFixed(8)} SOL ` +
+                                `(+${(actPct * 100).toFixed(2)}%)`
+                            );
+                            floorHover.push(
+                                `Loss Floor: ${floorPrice.toFixed(8)} SOL ` +
+                                `(-${(floorPct * 100).toFixed(2)}%)`
+                            );
                         }
 
                         if (lineTs.length >= 1) {
@@ -2884,7 +3020,7 @@
                                 y: actY.concat([lastAct]),
                                 type: 'scatter',
                                 mode: 'lines',
-                                name: 'Take-profit',
+                                name: 'Activation Target',
                                 line: {
                                     color: '#818cf8',
                                     width: 2,
@@ -2916,15 +3052,28 @@
                     }
 
                     // ----------------------------------------------------------
-                    // Re-entry threshold line, shown while the position is closed
-                    // after a SELL in the chart window. The reference's rule:
-                    //   minutes_since_sell <= reentry_decay_start_minutes:
-                    //       required drop = reentry_threshold_pct
-                    //   later: required drop = reentry_threshold_pct
-                    //                          - (minutes_since_sell - decay_start) * decay_rate
-                    //       (relaxes; negative = re-entry above the sale allowed;
-                    //        below -500% the rule is gone -> line stops)
-                    //   reentry_price = last_sell_close * (1 - required drop)
+                    // Re-entry threshold line, shown only while the bot is in
+                    // post-sell cooldown — i.e. position is 'closed' and a
+                    // SELL exists in the chart window. The line tracks the
+                    // actual price level a candidate close must reach to allow
+                    // a new buy:
+                    //
+                    //   if minutes_since_sell <= reentry_decay_start_minutes:
+                    //       threshold = reentry_threshold_pct
+                    //   else:
+                    //       relaxation = (minutes_since_sell - decay_start) * decay_rate
+                    //       threshold = reentry_threshold_pct - relaxation
+                    //
+                    //   reentry_price = last_sell_close * (1 - threshold)
+                    //
+                    // The line drifts UPWARD continuously after decay_start (it can
+                    // pass the sell close). We stop drawing once the threshold falls
+                    // below -5, where any price qualifies.
+                    //
+                    // This is the cooldown-after-sell gate. It's distinct from
+                    // the in-race re-entry hunt during stale_race / loss_floor_race,
+                    // which uses the same threshold formula but applies while
+                    // the position is still open.
                     if (data.bot && data.bot.position === 'closed' && sellPoints.length > 0) {
                         const lastSellPt = sellPoints[sellPoints.length - 1];
                         const sellIdx = chartData.findIndex(d => d.timestamp === lastSellPt.timestamp);
@@ -2933,17 +3082,24 @@
                             const reTs = [];
                             const reY = [];
                             const reHover = [];
+
                             for (let i = sellIdx; i < chartData.length; i++) {
+                                const d = chartData[i];
                                 const minutesSinceSell = i - sellIdx;
-                                const effective = reentryEffectivePct(minutesSinceSell);
-                                if (effective == null) break;
+                                const effective = getEffectiveReentryThreshold(minutesSinceSell, data.bot);
+                                if (effective == null) break;   // any price qualifies from here on
+
                                 const rePrice = lastSellClose * (1 - effective);
+                                const pctFromSell = Math.abs(effective) * 100;
                                 const fromSellLabel = effective >= 0
-                                    ? `${(effective * 100).toFixed(2)}% below sell`
-                                    : `${(-effective * 100).toFixed(2)}% above sell`;
-                                reTs.push(chartData[i].timestamp);
+                                    ? `${pctFromSell.toFixed(2)}% below sell`
+                                    : `${pctFromSell.toFixed(2)}% above sell`;
+                                reTs.push(d.timestamp);
                                 reY.push(rePrice);
-                                reHover.push(`Re-entry: ${rePrice.toFixed(8)} SOL (${fromSellLabel}, ${minutesSinceSell}m since sell)`);
+                                reHover.push(
+                                    `Re-entry: ${rePrice.toFixed(8)} SOL ` +
+                                    `(${fromSellLabel}, ${minutesSinceSell}m since sell)`
+                                );
                             }
 
                             if (reTs.length >= 1) {
@@ -3003,23 +3159,15 @@
                             range: xAxisRange,
                             autorange: false
                         },
-                        // Confidence axis (top)
+                        // Combo score axis (top)
                         yaxis3: {
                             title: 'Combo',
                             side: 'left',
                             color: '#94a3b8',
-                            domain: [0.82, 1],
+                            domain: [0.80, 1],
                             range: [0, 1],  // Fixed range 0-1
                             showgrid: true,
                             gridcolor: '#334155'
-                        },
-                        // Entry-candidate ribbon (thin strip below the scores)
-                        yaxis4: {
-                            domain: [0.78, 0.82],
-                            showticklabels: false,
-                            showgrid: false,
-                            zeroline: false,
-                            fixedrange: true
                         },
                         // Price axis (middle)
                         yaxis: {
@@ -3044,9 +3192,7 @@
                         height: 500,
                         paper_bgcolor: 'rgba(0,0,0,0)',
                         plot_bgcolor: '#0a0e1a',
-                        font: {color: '#f1f5f9'},
-                        annotations: ribbonAnnotations,
-                        shapes: thresholdShapes
+                        font: {color: '#f1f5f9'}
                     };
                                 
                     Plotly.newPlot(`chart-${botId}`, traces, layout, {responsive: true});
@@ -3405,7 +3551,7 @@
             if (!tradeList) return;
 
             if (allTrades.length === 0) {
-                tradeList.innerHTML = '<div class="info-box">No trades yet</div>';
+                setHTMLIfChanged(tradeList, '<div class="info-box">No trades yet</div>');
                 return;
             }
 
@@ -3489,7 +3635,7 @@
                 }
             });
 
-            tradeList.innerHTML = html;
+            setHTMLIfChanged(tradeList, html);
         }
 
         async function updatePipelineTerminal() {
@@ -3569,12 +3715,18 @@
             const imageSmall = document.getElementById(`init-image-small-${botId}`).value;
             const allocationType = document.getElementById(`init-allocation-type-${botId}`).value;
             const allocationValue = parseFloat(document.getElementById(`init-allocation-value-${botId}`).value);
-            const confidenceThreshold = null; // unused: the buy gate comes from strategy_config
             const maxPriceImpact = (parseFloat(document.getElementById(`init-impact-${botId}`).value) || 0.333) / 100;
+            const strategySelect = document.getElementById(`init-strategy-${botId}`);
+            const strategyName = strategySelect ? strategySelect.value : '';
 
 
             // Save values before they might be cleared
-            botInitInputs[botId] = { coin_symbol: coinSymbol, pool, allocation_type: allocationType, allocation_value: allocationValue };
+            botInitInputs[botId] = { coin_symbol: coinSymbol, pool, allocation_type: allocationType, allocation_value: allocationValue, strategy_name: strategyName };
+
+            if (!strategyName) {
+                alert('No usable strategy in the artifacts folder. Copy the files of strategy.ipynb\'s live_artifacts/ folder into live_pipeline/artifacts/.');
+                return;
+            }
 
             if (!coinSymbol || !pool) {
                 alert('Please fetch token info first, then fill in Pool Address');
@@ -3604,8 +3756,8 @@
                         allocation_value: allocationValue,
                         image_thumb: imageThumb,
                         image_small: imageSmall,
-                        confidence_threshold: confidenceThreshold,
-                        max_price_impact_pct: maxPriceImpact
+                        max_price_impact_pct: maxPriceImpact,
+                        strategy_name: strategyName
                     })
                     });
     
@@ -4027,7 +4179,20 @@
         // AUTO-REFRESH AND INITIALIZATION
         // ================================================================
         
+        // One refresh at a time; a request that arrives mid-refresh runs once after it.
+        let updateRunning = false, updateAgain = false;
         async function updateAll() {
+            if (updateRunning) { updateAgain = true; return; }
+            updateRunning = true;
+            try { await updateAllOnce(); }
+            catch (e) { console.error('Refresh failed:', e); }
+            finally {
+                updateRunning = false;
+                if (updateAgain) { updateAgain = false; updateAll(); }
+            }
+        }
+
+        async function updateAllOnce() {
             // Save focus state before updating
             saveFocusState();
 
@@ -4051,7 +4216,6 @@
 
             await Promise.all([
                 fetchSystemStats(),
-                fetchBotStatus(),
                 // Only pull the trades table when it actually changed.
                 (tradesChanged ? fetchTrades() : Promise.resolve()),
                 // fetchLogs() removed — updatePipelineTerminal() handles the
@@ -4059,8 +4223,7 @@
                 // terminals. Running both meant two functions wrote to the
                 // pipeline terminal each tick, each scrolling it to the
                 // bottom and undoing any user scroll.
-                fetchSolPrice(),
-                fetchWalletStatus()
+                fetchSolPrice()
             ]);
 
             // Update current tab content
@@ -4101,7 +4264,8 @@
             fetchBotData(),
             fetchSolPrice(),
             fetchWalletStatus(),
-            fetch('/api/config/strategy').then(r => r.json()).then(c => { strategyConfig = c; })
+            fetch('/api/config/strategy').then(r => r.json()).then(c => { if (!c.error) strategyConfig = c; }),
+            fetchStrategies()
         ]).then(() => {
             updateOverviewTab();
             updateAllTradeHistory();
@@ -4113,8 +4277,37 @@
 
         updateAll();
 
-        // Auto-refresh every 1 second
-        setInterval(updateAll, 1000);
+        // ================================================================
+        // LIVE UPDATES
+        // ================================================================
+        // The server checks its change markers every second and pushes them
+        // over /api/stream only when something changed (new candle, trade,
+        // capital snapshot, bot state, log line). Each push triggers one
+        // refresh; the DOM is only written where a value actually changed,
+        // and charts are only redrawn when they have new data.
+        let liveStream = null;
+        let refreshTimer = null;
+        let lastMarkers = null;
+        function scheduleRefresh() {
+            if (refreshTimer) return;
+            refreshTimer = setTimeout(() => { refreshTimer = null; updateAll(); }, 150);
+        }
+        function connectLiveStream() {
+            if (!window.EventSource) return;
+            liveStream = new EventSource('/api/stream');
+            liveStream.addEventListener('markers', (e) => {
+                if (e.data === lastMarkers) return;
+                lastMarkers = e.data;
+                scheduleRefresh();
+            });
+        }
+        connectLiveStream();
+        const streamDown = () => !liveStream || liveStream.readyState !== EventSource.OPEN;
+
+        setInterval(fetchSystemStats, 5000);                         // uptime, CPU, RAM
+        setInterval(fetchSolPrice, 60000);                           // SOL/USD
+        setInterval(updateAll, 30000);                               // time-based fields (durations)
+        setInterval(() => { if (streamDown()) updateAll(); }, 5000); // fallback while the stream is down
     </script>
 </body>
 </html>
