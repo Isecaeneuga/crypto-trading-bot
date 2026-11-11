@@ -279,7 +279,7 @@ Controls per bot: pause, resume, deallocate, sell now, and sell on the next sell
 
 **Live updates.** The page refreshes when the live update stream reports a change, plus every 30 seconds for the elapsed-time fields; if the stream is down, it polls every 5 seconds. Text and panels are only rewritten when their content changes, and charts are only redrawn when they have new data. The charts use Plotly, which the browser loads from its CDN.
 
-The video below briefly shows the live dashboard in paper mode, with two bots running and one paused.
+The video below briefly shows the live dashboard in paper mode with 3 bots running, one being paused and then resumed again.
 
 <!-- TODO: record the GIF and save it as research_notebooks/readme_visuals/dashboard.gif -->
 
